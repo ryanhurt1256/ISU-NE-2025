@@ -39,7 +39,10 @@ GRAPH_X, GRAPH_Y = MARGIN_LEFT, MARGIN_TOP                                      
 LEVER_TRACK_TOP    = GRAPH_Y + GRAPH_HEIGHT + 140                                    # compute y-position of lever track top
 LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 270                                           # compute y-position of lever track bottom
 LEVER_HEIGHT       = 95                                                              # set lever handle height (pixels)
-NUM_LEVERS         = 4                                                               # set number of control rods/levers
+
+NUM_LEVERS         = 1                                                               # set number of control rods/levers (coarse only)
+lever_names        = ["Coarse CR"]                                                   # labels for each rod lever (single lever)  # coarse-only
+
 lever_spacing      = GRAPH_WIDTH // (NUM_LEVERS + 1)                                 # compute horizontal spacing between levers
 lever_x_positions  = [GRAPH_X + lever_spacing * (i + 1) for i in range(NUM_LEVERS)]  # compute x-center positions for each lever
 lever_positions    = [LEVER_TRACK_BOTTOM - LEVER_HEIGHT] * NUM_LEVERS                # initialize all levers at full down (bottom) position
@@ -89,7 +92,6 @@ power_button_rect = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  
 power_on_time = 0.0                                                                  # timestamp when power was turned on (seconds)
 SCRAM_GRACE_S = 10.0                                                                 # startup grace period for instrument scrams (SCRAM still works)
 
-lever_names = ["Fine CR", "Fine CR", "Fine CR", "Coarse CR"]                         # labels for each rod lever
 dial_names  = ["CH2 Range", "CH3 Range"]                                             # labels for each dial
 
 CH2_LOW_SCRAM_A = 2.0e-12                                                            # channel 2 low-current scram threshold (amps)
@@ -250,12 +252,13 @@ def read_controls_from_serial(ser):                                             
         if not raw:                                                                  # if line is empty (no data)
             return None                                                              # return None to indicate no update
         parts = raw.split(",")                                                       # split comma-separated values into fields
-        if len(parts) < 6:                                                           # require at least 6 fields (4 rods + power + scram)
+        if len(parts) < 6:                                                           # require at least 6 fields (legacy format still supported)
             return None                                                              # reject malformed packet
         rods = [float(p) for p in parts[:4]]                                         # parse rod fractions (expected 0.0..1.0)
         power_sw = bool(int(float(parts[4])))                                        # parse power switch as boolean (0/1)
         scram_sw = bool(int(float(parts[5])))                                        # parse scram switch as boolean (0/1)
-        return rods, power_sw, scram_sw                                              # return parsed values as a tuple
+        coarse = rods[3] if len(rods) >= 4 else 0.0                                  # extract coarse rod fraction safely (legacy)  # coarse-only
+        return coarse, power_sw, scram_sw                                            # return coarse-only value plus switches  # coarse-only
     except Exception:                                                                # ignore any parse/IO errors safely
         return None                                                                  # return None on error to avoid crashing
 
@@ -333,13 +336,10 @@ while running:                                                                  
 
     serial_controls = read_controls_from_serial(ser)                                 # read one serial packet (if available)
     if serial_controls:                                                              # if a valid packet was parsed
-        rods, power_sw, scram_sw = serial_controls                                   # unpack rod fractions and switches
+        coarse_frac, power_sw, scram_sw = serial_controls                            # unpack coarse rod fraction and switches  # coarse-only
         travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)               # compute lever travel distance (pixels)
-
-        i = 3                                                                        # select coarse rod index (0-based)
-        if len(rods) > i:                                                            # ensure rods list includes coarse value
-            frac = max(0.0, min(1.0, rods[i]))                                       # clamp rod fraction to [0,1]
-            lever_positions[i] = LEVER_TRACK_TOP + frac * travel                     # map fraction -> lever y position
+        frac = max(0.0, min(1.0, float(coarse_frac)))                                # clamp coarse rod fraction to [0,1]  # coarse-only
+        lever_positions[0] = LEVER_TRACK_TOP + frac * travel                         # map fraction -> single lever y position  # coarse-only
 
         if power_sw and not power_on:                                                # detect power switch rising edge
             power_on = True                                                          # set power state to on
@@ -398,14 +398,14 @@ while running:                                                                  
 
             if power_on and not scram_active:                                        # allow selecting controls only if running
                 lever_clicked = False                                                # initialize “clicked a lever” flag
-                for i, x in enumerate(lever_x_positions):                            # iterate each lever x position with index
-                    if (x - 14 < mx < x + 14 and                                    # check x within lever handle width
+                for i, x in enumerate(lever_x_positions):                            # iterate each lever x position with index (only 1)
+                    if (x - 14 < mx < x + 14 and                                     # check x within lever handle width
                         lever_positions[i] < my < lever_positions[i] + LEVER_HEIGHT):# check y within lever handle bounds
                         lever_clicked = True                                         # mark that a lever was clicked
                         lever_active[:] = [False] * NUM_LEVERS                       # clear all lever active highlights
                         dial_active[:]  = [False] * NUM_DIALS                        # clear all dial active highlights
                         selected_dial = None                                         # clear dial selection
-                        selected_lever = i                                           # select this lever index
+                        selected_lever = i                                           # select this (only) lever index
                         lever_active[i] = True                                       # set this lever as active/highlighted
                         lever_activation_time[i] = now                               # stamp last interaction time
                         break                                                        # stop searching once a lever is selected
@@ -455,7 +455,7 @@ while running:                                                                  
     if moved_this_frame:                                                             # if any control moved in this frame
         last_control_move_time = now                                                 # update last control movement timestamp
 
-    for i in range(NUM_LEVERS):                                                      # loop over levers for cooldown handling
+    for i in range(NUM_LEVERS):                                                      # loop over levers for cooldown handling (only 1)
         if lever_active[i] and (now - lever_activation_time[i]) > COOLDOWN_TIME:     # if lever has been idle past cooldown
             lever_active[i] = False                                                  # deactivate lever highlight
             if selected_lever == i:                                                  # if that lever was selected
@@ -468,8 +468,8 @@ while running:                                                                  
                 selected_dial = None                                                 # clear dial selection
 
     if scram_active:                                                                 # if SCRAM is active
-        for i in range(NUM_LEVERS):                                                  # iterate all levers
-            lever_positions[i] = LEVER_TRACK_BOTTOM - LEVER_HEIGHT                   # force levers fully down (insertion)
+        for i in range(NUM_LEVERS):                                                  # iterate all levers (only 1)
+            lever_positions[i] = LEVER_TRACK_BOTTOM - LEVER_HEIGHT                   # force lever fully down (insertion)
 
     if scram_active and (now - scram_start_time > 3.0):                              # if SCRAM has elapsed beyond reset time
         power_on = False                                                             # turn power off after SCRAM sequence
@@ -487,7 +487,7 @@ while running:                                                                  
         ch2_period_s = float("inf")                                                  # reset computed period
         ch2_ln_buf.clear()                                                           # clear period fitting buffer
         ch2_period_bad_time = 0.0                                                    # reset persistent-fast accumulator
-        lever_positions[:] = [LEVER_TRACK_BOTTOM - LEVER_HEIGHT] * NUM_LEVERS        # reset levers to bottom positions
+        lever_positions[:] = [LEVER_TRACK_BOTTOM - LEVER_HEIGHT] * NUM_LEVERS        # reset lever to bottom position (single)
         dial_angles[0] = angle_from_detent(2)                                        # reset CH2 dial to startup detent
         dial_angles[1] = angle_from_detent(1)                                        # reset CH3 dial to startup detent
         selected_lever = None                                                        # clear lever selection
@@ -497,17 +497,14 @@ while running:                                                                  
         last_control_move_time = now                                                 # inhibit scrams immediately after reset
 
     if power_on and not scram_active:                                                # run kinetics only when powered and not scrammed
-        rho_fine = 0.00310                                                           # fine rod worth magnitude (reactivity units)
-        rho_coarse = 0.01250                                                         # coarse rod worth magnitude (reactivity units)
-        lever_worths = [rho_fine, rho_fine, rho_fine, rho_coarse]                    # map worth magnitudes to each lever index
+        rho_coarse = 0.01250                                                         # coarse rod worth magnitude (reactivity units)  # coarse-only
         travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)               # compute travel distance for fraction mapping
         rho_new = 0.0                                                                # reset reactivity sum for this frame
 
-        for i in range(NUM_LEVERS):                                                  # sum reactivity contributions from each lever
-            frac_in = (LEVER_TRACK_BOTTOM - LEVER_HEIGHT - lever_positions[i]) / travel if travel > 0.0 else 0.0  # compute insertion fraction
-            frac_in = max(0.0, min(1.0, frac_in))                                    # clamp insertion fraction to [0,1]
-            worth_fraction = rod_curve(frac_in)                                      # compute nonlinear worth fraction from insertion
-            rho_new += (2.0 * worth_fraction - 1.0) * lever_worths[i]                # map [0,1] worth to [-1,+1] and scale by rod worth
+        frac_in = (LEVER_TRACK_BOTTOM - LEVER_HEIGHT - lever_positions[0]) / travel if travel > 0.0 else 0.0      # insertion fraction (single)
+        frac_in = max(0.0, min(1.0, frac_in))                                        # clamp insertion fraction to [0,1]
+        worth_fraction = rod_curve(frac_in)                                          # compute nonlinear worth fraction from insertion
+        rho_new = (2.0 * worth_fraction - 1.0) * rho_coarse                          # map to [-worth,+worth] for coarse rod only  # coarse-only
 
         RHO_POS_LIMIT = 0.60 * beta                                                  # set positive reactivity clamp (safer low-power control)
         RHO_NEG_LIMIT = -0.2                                                         # set negative reactivity clamp (shutdown margin)
@@ -689,7 +686,7 @@ while running:                                                                  
     scram_text = font.render("SCRAM", True, BLACK)                                   # render SCRAM text label
     screen.blit(scram_text, scram_text.get_rect(center=(scram_button_rect.centerx, scram_button_rect.bottom + 30)))  # draw label under button
 
-    for i in range(NUM_LEVERS):                                                      # draw each lever and its track
+    for i in range(NUM_LEVERS):                                                      # draw each lever and its track (only 1)
         x = lever_x_positions[i]                                                     # get lever x position
         y = lever_positions[i]                                                       # get lever y position
         pygame.draw.rect(screen, GREY, (x - 6, LEVER_TRACK_TOP, 12, LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP))         # draw lever track
@@ -740,4 +737,4 @@ while running:                                                                  
     clock.tick(60)                                                                   # cap loop to ~60 FPS
 
 pygame.quit()                                                                        # cleanly shut down pygame modules
-sys.exit()                                                                           # exit the Python process cleanly
+sys.exit()                                                                           # exit the program cleanly
