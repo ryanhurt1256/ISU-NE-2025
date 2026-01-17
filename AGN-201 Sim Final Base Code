@@ -1,0 +1,725 @@
+import pygame                                                                        # import pygame for graphics, events, timing
+import sys                                                                           # import sys for clean exit
+import math                                                                          # import math for exp, log10, trig
+import time                                                                          # import time for dt timing
+import collections                                                                   # import collections for deque history buffers
+
+try:                                                                                 # start try for optional serial import
+    import serial                                                                    # import pyserial if installed
+except Exception:                                                                    # if serial import fails
+    serial = None                                                                    # disable serial I/O by setting serial to None
+
+pygame.init()                                                                        # initialize pygame modules
+
+WIDTH, HEIGHT = 1700, 1200                                                           # display window size
+screen = pygame.display.set_mode((WIDTH, HEIGHT))                                    # create window surface
+pygame.display.set_caption("Control Panel")                                          # set window title
+clock = pygame.time.Clock()                                                          # create clock for FPS limiting
+
+WHITE  = (255, 255, 255)                                                             # color: white
+GREY   = (150, 150, 150)                                                             # color: grey
+BLUE   = (50, 100, 255)                                                              # color: blue
+RED    = (255, 60, 60)                                                               # color: red
+YELLOW = (255, 255, 0)                                                               # color: yellow
+BLACK  = (0, 0, 0)                                                                   # color: black
+SCRAM_RED = (255, 0, 0)                                                              # color: scram red
+DIAL_INACTIVE_COLOR  = (50, 50, 50)                                                  # color: dial inactive
+LEVER_INACTIVE_COLOR = (80, 80, 80)                                                  # color: lever inactive
+GREEN  = (0, 200, 0)                                                                 # color: green
+
+MARGIN_LEFT, MARGIN_TOP, MARGIN_RIGHT, MARGIN_BOTTOM = 170, 125, 160, 210            # margins borders
+GRAPH_WIDTH  = WIDTH - MARGIN_LEFT - MARGIN_RIGHT                                    # total graph width
+GRAPH_HEIGHT = 340                                                                    # graph height
+GRAPH_X, GRAPH_Y = MARGIN_LEFT, MARGIN_TOP                                            # graph top-left
+
+LEVER_TRACK_TOP    = GRAPH_Y + GRAPH_HEIGHT + 140                                     # lever track top y
+LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 270                                            # lever track bottom y
+LEVER_HEIGHT       = 95                                                               # lever handle height
+NUM_LEVERS         = 4                                                                # number of levers
+lever_spacing      = GRAPH_WIDTH // (NUM_LEVERS + 1)                                  # spacing between levers
+lever_x_positions  = [GRAPH_X + lever_spacing * (i + 1) for i in range(NUM_LEVERS)]   # lever x positions
+lever_positions    = [LEVER_TRACK_BOTTOM - LEVER_HEIGHT] * NUM_LEVERS                 # lever handles start at bottom (operator start)
+
+NUM_DIALS   = 2                                                                       # number of dials
+DIAL_RADIUS = 48                                                                      # dial radius
+dial_spacing = GRAPH_WIDTH // (NUM_DIALS + 1)                                         # dial spacing
+dial_centers = [(GRAPH_X + dial_spacing * (i + 1), LEVER_TRACK_BOTTOM + 235)          # dial centers x,y
+                for i in range(NUM_DIALS)]                                            # build centers list
+dial_angles  = [-90] * NUM_DIALS                                                      # dial angles start at -90 (detent 0)
+
+selected_lever = None                                                                 # selected lever index
+selected_dial  = None                                                                 # selected dial index
+lever_active   = [False] * NUM_LEVERS                                                 # lever active flags
+dial_active    = [False] * NUM_DIALS                                                  # dial active flags
+lever_activation_time = [0.0] * NUM_LEVERS                                            # lever last activity time
+dial_activation_time  = [0.0] * NUM_DIALS                                             # dial last activity time
+COOLDOWN_TIME = 3.0                                                                   # inactivity timeout to auto-deselect
+
+scram_active     = False                                                              # scram state flag
+scram_start_time = 0.0                                                                # scram start timestamp
+
+power_history = collections.deque(maxlen=300)                                         # plotted power history
+
+MAX_POWER = 5.0                                                                       # plotted cap only
+P_SCALE   = 3.0                                                                       # n -> power scale
+current_power = 0.0                                                                   # plotted power (capped)
+power_raw_display = 0.0                                                               # uncapped display power
+
+beta   = 0.0065                                                                       # delayed fraction
+Lambda = 5e-5                                                                         # prompt neutron lifetime
+lam    = 0.08                                                                         # decay constant
+
+S_SOURCE = 1                                                                          # source strength (lowered as requested)
+
+n = 1e-12                                                                             # neutron population floor
+C = 0.0                                                                               # precursor concentration
+rho_prev = 0.0                                                                        # previous rho for prompt jump
+rho_new = 0.0                                                                         # current rho for display and logic
+
+last_time = time.time()                                                               # previous frame time
+
+button_width, button_height = 120, 55                                                 # power button size
+power_on = False                                                                      # power state
+power_button_rect = pygame.Rect(60, HEIGHT - 155, button_width, button_height)        # power button rect
+
+power_on_time = 0.0                                                                   # time when power turned on (for grace)
+SCRAM_GRACE_S = 10.0                                                                  # startup grace: inhibit channel scrams (SCRAM button still works)
+
+lever_names = ["Fine CR", "Fine CR", "Fine CR", "Coarse CR"]                          # lever labels
+dial_names  = ["CH2 Range", "CH3 Range"]                                              # dial labels
+
+CH2_LOW_SCRAM_A = 2.0e-12                                                             # CH2 low current scram threshold
+CH2_HIGH_SCRAM_A = 1.8e-7                                                             # CH2 high current scram threshold
+CH2_PERIOD_SCRAM_S = 5.0                                                              # CH2 period scram threshold (seconds)
+
+CH3_LOW_PCT_SCRAM = 0.05                                                              # CH3 low percent scram (window position)
+CH3_HI_PCT_SCRAM = 0.95                                                               # CH3 high percent scram (window position)
+CH3_MAX_LOCKOUT_A = 2.0e-7                                                            # CH3 lockout threshold
+
+CH2_RANGES = [0.3e-12, 0.3e-11, 0.3e-10, 0.3e-9, 0.3e-8, 0.3e-7, 0.3e-6]               # CH2 FS ranges for detents -3..+3
+
+CH3_LOG_SPAN_DECADES = 4                                                              # CH3 window span in decades
+CH3_LOG_MAX_AT_0 = -8                                                                 # CH3 top decade when detent=0
+
+I_FLOOR = 1e-13                                                                       # current floor for logs
+
+I_PER_WATT_CH2 = CH2_HIGH_SCRAM_A / 10.0                                              # calibration A/W for CH2
+I_PER_WATT_CH3 = I_PER_WATT_CH2                                                       # calibration A/W for CH3
+
+CH2_TAU = 0.25                                                                        # CH2 lag tau
+CH3_TAU = 0.25                                                                        # CH3 lag tau
+
+ch2_I_ind = I_FLOOR                                                                   # CH2 indicated current
+ch3_I_ind = I_FLOOR                                                                   # CH3 indicated current
+ch2_period_s = float("inf")                                                           # CH2 period
+ch3_hi_lockout = False                                                                # CH3 lockout latch
+
+ch2_history = collections.deque(maxlen=300)                                           # CH2 current history
+ch3_history = collections.deque(maxlen=300)                                           # CH3 current history
+
+CH2_PERIOD_FIT_WINDOW_S = 1.0                                                         # compute period from ~last 1.0 s
+CH2_PERIOD_PERSIST_S    = 0.25                                                        # require fast-period for 0.25 s before scram
+CONTROL_MOVE_INHIBIT_S  = 0.60                                                        # inhibit period/% scrams after control movement
+
+ch2_ln_buf = collections.deque()                                                      # holds (t, ln(I)) for period fit
+ch2_period_bad_time = 0.0                                                             # accumulator for persistent fast-period
+last_control_move_time = 0.0                                                          # timestamp of last rod/dial movement
+
+scram_button_rect = pygame.Rect(70, LEVER_TRACK_TOP + 40, 90, 90)                     # clickable SCRAM square rect
+
+
+def first_order_lag(y, x, dt, tau):                                                   # first order lag helper
+    if tau <= 1e-6:                                                                   # if tau is essentially zero
+        return x                                                                      # return input directly
+    alpha = dt / (tau + dt)                                                           # compute alpha
+    return y + alpha * (x - y)                                                        # return filtered output
+
+
+def dial_detent(angle_deg):                                                           # convert dial angle to detent
+    d = int(round((angle_deg - (-90.0)) / 30.0))                                      # compute detent from 30° steps
+    return max(-3, min(3, d))                                                         # clamp to -3..+3
+
+
+def angle_from_detent(det):                                                           # convert detent to angle
+    return -90.0 + 30.0 * float(det)                                                  # map detent to angle
+
+
+def format_amps(I):                                                                   # format current to readable units
+    I = float(I)                                                                      # ensure float
+    a = abs(I)                                                                        # magnitude
+    if a >= 1e-6:                                                                     # microamps
+        return f"{I/1e-6:.2f} µA"                                                     # return µA
+    if a >= 1e-9:                                                                     # nanoamps
+        return f"{I/1e-9:.2f} nA"                                                     # return nA
+    if a >= 1e-12:                                                                    # picoamps
+        return f"{I/1e-12:.2f} pA"                                                    # return pA
+    return f"{I:.2e} A"                                                               # return scientific A
+
+
+def rod_curve(x):                                                                     # rod worth curve fraction
+    a = 3.3                                                                           # curve constant
+    return 1.0 - math.exp(-a * x)                                                     # return 1-exp(-ax)
+
+
+def smooth_points(points, steps=6):                                                   # smooth polyline for nicer plots
+    smoothed = []                                                                     # output list
+    if len(points) < 2:                                                               # if not enough points
+        return points                                                                 # return as-is
+    for i in range(len(points) - 1):                                                  # loop segments
+        x1, y1 = points[i]                                                            # segment start
+        x2, y2 = points[i + 1]                                                        # segment end
+        for t in range(steps):                                                        # insert intermediate points
+            alpha = t / steps                                                         # interpolation fraction
+            smoothed.append((x1 * (1 - alpha) + x2 * alpha, y1 * (1 - alpha) + y2 * alpha))  # append interpolated point
+    smoothed.append(points[-1])                                                       # include last point
+    return smoothed                                                                   # return smoothed list
+
+
+def draw_dial_ticks(cx, cy, radius):                                                  # draw dial ticks and numbers
+    font = pygame.font.SysFont(None, 18)                                              # dial font
+    angle_step = 30                                                                   # degrees per detent
+    for i in range(7):                                                                # loop -3..+3 marks
+        angle_deg = -90 - angle_step * (i - 3)                                        # tick angle
+        angle_rad = math.radians(angle_deg)                                           # radians
+        tick_len = 10 if i == 3 else 6                                                # center tick longer
+        label_txt = "0" if i == 3 else str(i - 3)                                     # label text
+        outer_x = cx + radius * math.cos(angle_rad)                                   # outer x
+        outer_y = cy + radius * math.sin(angle_rad)                                   # outer y
+        inner_x = cx + (radius - tick_len) * math.cos(angle_rad)                      # inner x
+        inner_y = cy + (radius - tick_len) * math.sin(angle_rad)                      # inner y
+        pygame.draw.line(screen, BLACK, (outer_x, outer_y), (inner_x, inner_y), 2)    # draw tick
+        label_x = cx + (radius + 22) * math.cos(angle_rad)                            # label x
+        label_y = cy + (radius + 22) * math.sin(angle_rad)                            # label y
+        label = font.render(label_txt, True, BLACK)                                   # render label
+        screen.blit(label, label.get_rect(center=(label_x, label_y)))                 # blit label
+
+
+def reset_instruments_to_power(P_watts):                                              # reset instruments on power on
+    global ch2_I_ind, ch3_I_ind, ch2_period_s, ch3_hi_lockout                         # declare globals
+    global ch2_ln_buf, ch2_period_bad_time                                            # declare globals
+    ch2_I_ind = max(I_FLOOR, I_PER_WATT_CH2 * max(0.0, P_watts))                      # set CH2 indicated
+    ch3_I_ind = max(I_FLOOR, I_PER_WATT_CH3 * max(0.0, P_watts))                      # set CH3 indicated
+    ch2_period_s = float("inf")                                                       # reset period
+    ch3_hi_lockout = False                                                            # clear lockout
+    ch2_history.clear()                                                               # clear CH2 history
+    ch3_history.clear()                                                               # clear CH3 history
+    ch2_ln_buf.clear()                                                                # clear period buffer
+    ch2_period_bad_time = 0.0                                                         # clear persistence timer
+
+
+def kinetics_rhs(state, rho):                                                         # kinetics derivatives
+    n_s, C_s = state                                                                  # unpack state
+    dn_dt = ((rho - beta) / Lambda) * n_s + lam * C_s + S_SOURCE                      # dn/dt (1-group PK + source)
+    dC_dt = (beta / Lambda) * n_s - lam * C_s                                         # dC/dt (1 delayed group)
+    return dn_dt, dC_dt                                                               # return derivatives
+
+
+def rk4_step(state, dt_sub, rho):                                                     # rk4 integrator step
+    n0, C0 = state                                                                    # unpack
+    k1n, k1C = kinetics_rhs((n0, C0), rho)                                             # k1
+    k2n, k2C = kinetics_rhs((n0 + 0.5 * dt_sub * k1n, C0 + 0.5 * dt_sub * k1C), rho)   # k2
+    k3n, k3C = kinetics_rhs((n0 + 0.5 * dt_sub * k2n, C0 + 0.5 * dt_sub * k2C), rho)   # k3
+    k4n, k4C = kinetics_rhs((n0 + dt_sub * k3n, C0 + dt_sub * k3C), rho)               # k4
+    n_new = n0 + (dt_sub / 6.0) * (k1n + 2 * k2n + 2 * k3n + k4n)                      # new n
+    C_new = C0 + (dt_sub / 6.0) * (k1C + 2 * k2C + 2 * k3C + k4C)                      # new C
+    return n_new, C_new                                                               # return updated state
+
+
+SERIAL_PORT, BAUDRATE = "/dev/ttyUSB0", 115200                                        # serial defaults
+
+
+def setup_serial(port=SERIAL_PORT, baud=BAUDRATE):                                    # open serial if available
+    if serial is None:                                                                # if pyserial missing
+        return None                                                                   # disable serial
+    try:                                                                              # try open serial
+        ser = serial.Serial(port, baud, timeout=0.05)                                 # open port
+        time.sleep(1.0)                                                               # wait for reset
+        return ser                                                                    # return serial object
+    except Exception:                                                                 # on failure
+        return None                                                                   # return None
+
+
+ser = setup_serial()                                                                  # initialize serial once
+
+
+def read_controls_from_serial(ser):                                                   # parse serial line
+    if ser is None:                                                                   # if no serial
+        return None                                                                   # no data
+    try:                                                                              # try read/parse
+        raw = ser.readline().decode(errors="ignore").strip()                          # read line
+        if not raw:                                                                   # if empty
+            return None                                                               # no update
+        parts = raw.split(",")                                                        # split csv
+        if len(parts) < 6:                                                            # require at least 6 fields
+            return None                                                               # invalid
+        rods = [float(p) for p in parts[:4]]                                          # parse rods
+        power_sw = bool(int(float(parts[4])))                                         # parse power
+        scram_sw = bool(int(float(parts[5])))                                         # parse scram
+        return rods, power_sw, scram_sw                                               # return values
+    except Exception:                                                                 # on any error
+        return None                                                                   # ignore
+
+
+def draw_ticks_and_labels():                                                          # draw axes ticks and labels
+    font = pygame.font.SysFont(None, 20)                                              # tick font
+    linear_width = GRAPH_WIDTH // 2                                                   # left panel width
+    right_start = GRAPH_X + linear_width                                              # right panel start x
+
+    det2 = dial_detent(dial_angles[0])                                                # CH2 detent
+    fs2 = CH2_RANGES[det2 + 3]                                                        # CH2 FS
+
+    for frac, lbl in [(0.0, "0"), (0.5, "0.5FS"), (1.0, "FS")]:                       # CH2 ticks
+        x = GRAPH_X + frac * linear_width                                             # tick x
+        y = GRAPH_Y + GRAPH_HEIGHT                                                    # tick y
+        pygame.draw.line(screen, BLACK, (x, y), (x, y + 8), 2)                        # tick line
+        if frac > 0.0:                                                                # label non-zero ticks
+            text = font.render(lbl, True, BLACK)                                      # render label
+            screen.blit(text, text.get_rect(center=(x, y + 22)))                      # blit label
+
+    fs_text = font.render(f"CH2 FS={format_amps(fs2)}", True, BLACK)                  # CH2 FS text
+    screen.blit(fs_text, (GRAPH_X + 10, GRAPH_Y + GRAPH_HEIGHT + 10))                 # blit FS text
+
+    det3 = dial_detent(dial_angles[1])                                                # CH3 detent
+    ch3_log_max = CH3_LOG_MAX_AT_0 + det3                                             # CH3 window top decade
+    ch3_log_min = ch3_log_max - CH3_LOG_SPAN_DECADES                                  # CH3 window bottom decade
+
+    for decade in range(int(math.floor(ch3_log_min)), int(math.ceil(ch3_log_max)) + 1):  # loop decades
+        frac = (decade - ch3_log_min) / max(1e-9, (ch3_log_max - ch3_log_min))        # normalized location
+        frac = max(0.0, min(1.0, frac))                                               # clamp
+        x = right_start + frac * linear_width                                         # tick x
+        y = GRAPH_Y + GRAPH_HEIGHT                                                    # tick y
+        pygame.draw.line(screen, BLACK, (x, y), (x, y + 8), 2)                        # tick line
+        if frac > 0.03:                                                               # skip near split
+            lbl = font.render(f"10^{decade}", True, BLACK)                            # render label
+            screen.blit(lbl, lbl.get_rect(center=(x, y + 22)))                        # blit label
+
+    max_time = power_history.maxlen                                                   # y axis range
+    for time_tick in range(0, max_time + 1, 50):                                      # y tick step
+        y = GRAPH_Y + (time_tick / max_time) * GRAPH_HEIGHT                           # tick y
+        pygame.draw.line(screen, BLACK, (GRAPH_X - 8, y), (GRAPH_X, y), 2)            # tick line
+        label = font.render(str(time_tick), True, BLACK)                              # label text
+        screen.blit(label, label.get_rect(center=(GRAPH_X - 28, y)))                  # blit label
+
+
+def fit_period_from_buffer(buf):                                                      # compute period via slope fit to ln(I)
+    if len(buf) < 6:                                                                  # need a few points
+        return float("inf")                                                           # not enough data
+    t0 = buf[0][0]                                                                    # reference time
+    xs = [p[0] - t0 for p in buf]                                                     # times relative to t0
+    ys = [p[1] for p in buf]                                                          # ln(I)
+    xbar = sum(xs) / len(xs)                                                         # mean x
+    ybar = sum(ys) / len(ys)                                                         # mean y
+    num = 0.0                                                                         # covariance numerator
+    den = 0.0                                                                         # variance denominator
+    for x, y in zip(xs, ys):                                                          # loop samples
+        dx = x - xbar                                                                 # x deviation
+        dy = y - ybar                                                                 # y deviation
+        num += dx * dy                                                                # accumulate
+        den += dx * dx                                                                # accumulate
+    if den <= 1e-12:                                                                  # protect divide
+        return float("inf")                                                           # undefined slope
+    slope = num / den                                                                 # slope d(ln I)/dt
+    return (1.0 / slope) if slope > 0.0 else float("inf")                             # period = 1/slope for rising signal
+
+
+running = True                                                                        # main loop flag
+while running:                                                                        # main loop
+    screen.fill(WHITE)                                                                # clear screen
+    now = time.time()                                                                 # current time
+    dt = now - last_time                                                              # frame dt
+    if dt <= 0.0:                                                                     # protect dt
+        dt = 1.0 / 60.0                                                               # default dt
+    if dt > 0.1:                                                                      # clamp dt
+        dt = 0.1                                                                      # max dt
+    last_time = now                                                                   # update last time
+
+    serial_controls = read_controls_from_serial(ser)                                  # read serial
+    if serial_controls:                                                               # if serial packet present
+        rods, power_sw, scram_sw = serial_controls                                    # unpack
+        travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)                # travel
+        for i in range(min(NUM_LEVERS, len(rods))):                                   # update levers
+            frac = max(0.0, min(1.0, rods[i]))                                        # clamp fraction
+            lever_positions[i] = LEVER_TRACK_TOP + frac * travel                      # set lever y from serial
+        if power_sw and not power_on:                                                 # power switch rising edge
+            power_on = True                                                           # set power on
+            power_on_time = now                                                       # record power on time for grace
+            scram_active = False                                                      # clear scram
+            scram_start_time = 0.0                                                    # clear scram timer
+            current_power = 1.0                                                       # start at 1 W
+            power_raw_display = 1.0                                                   # set display power
+            n = max(1e-12, current_power / P_SCALE)                                   # set n from power
+            C = (beta / (Lambda * lam)) * n                                           # set C at steady state
+            dial_angles[0] = angle_from_detent(2)                                     # set CH2 range to detent +2
+            dial_angles[1] = angle_from_detent(1)                                     # set CH3 range to detent +1
+            reset_instruments_to_power(current_power)                                 # reset instruments
+            power_history.clear()                                                     # clear power history
+            last_control_move_time = now                                              # inhibit right after power-on
+        if (not power_sw) and power_on:                                               # power switch falling edge
+            scram_active = True                                                       # trigger scram
+            scram_start_time = now                                                    # set scram time
+        if scram_sw:                                                                  # scram switch
+            scram_active = True                                                       # trigger scram
+            scram_start_time = now                                                    # set scram time
+
+    for event in pygame.event.get():                                                  # handle events
+        if event.type == pygame.QUIT:                                                 # close window event
+            running = False                                                           # stop loop
+        elif event.type == pygame.MOUSEBUTTONDOWN:                                    # mouse click event
+            mx, my = event.pos                                                        # mouse position
+
+            if power_button_rect.collidepoint((mx, my)):                              # if POWER button clicked
+                if power_on:                                                          # if already on
+                    scram_active = True                                               # scram on power-off click
+                    scram_start_time = now                                            # set scram time
+                else:                                                                 # if currently off
+                    power_on = True                                                   # power on
+                    power_on_time = now                                               # record power on time for grace
+                    scram_active = False                                              # clear scram
+                    scram_start_time = 0.0                                            # clear scram timer
+                    current_power = 1.0                                               # start at 1 W
+                    power_raw_display = 1.0                                           # set display power
+                    n = max(1e-12, current_power / P_SCALE)                           # set n
+                    C = (beta / (Lambda * lam)) * n                                   # set C steady
+                    dial_angles[0] = angle_from_detent(2)                             # set CH2 range to detent +2
+                    dial_angles[1] = angle_from_detent(1)                             # set CH3 range to detent +1
+                    reset_instruments_to_power(current_power)                         # reset instruments
+                    power_history.clear()                                             # clear power history
+                    last_control_move_time = now                                      # inhibit right after power-on
+                continue                                                              # skip selecting controls on POWER click
+
+            if scram_button_rect.collidepoint((mx, my)):                              # if SCRAM square clicked
+                if power_on:                                                          # only scram if powered
+                    scram_active = True                                               # trigger scram
+                    scram_start_time = now                                            # set scram time
+                continue                                                              # skip selection on scram click
+
+            if power_on and not scram_active:                                         # only allow selection when running
+                lever_clicked = False                                                 # lever click flag
+                for i, x in enumerate(lever_x_positions):                             # check each lever
+                    if (x - 14 < mx < x + 14 and lever_positions[i] < my < lever_positions[i] + LEVER_HEIGHT):  # lever hitbox
+                        lever_clicked = True                                          # mark clicked
+                        lever_active[:] = [False] * NUM_LEVERS                        # clear lever actives
+                        dial_active[:]  = [False] * NUM_DIALS                         # clear dial actives
+                        selected_dial = None                                          # clear dial selection
+                        selected_lever = i                                            # select lever
+                        lever_active[i] = True                                        # activate lever
+                        lever_activation_time[i] = now                                # set activity time
+                        break                                                         # stop searching
+                if not lever_clicked:                                                 # if no lever selected
+                    for i, (cx, cy) in enumerate(dial_centers):                       # check each dial
+                        if math.hypot(mx - cx, my - cy) < DIAL_RADIUS + 12:           # dial hit test
+                            lever_active[:] = [False] * NUM_LEVERS                    # clear lever actives
+                            dial_active[:]  = [False] * NUM_DIALS                     # clear dial actives
+                            selected_lever = None                                     # clear lever selection
+                            selected_dial = i                                         # select dial
+                            dial_active[i] = True                                     # activate dial
+                            dial_activation_time[i] = now                             # set activity time
+                            break                                                     # stop searching
+
+    keys = pygame.key.get_pressed()                                                   # get key states
+    moved_this_frame = False                                                          # track any rod/dial movement
+
+    if power_on and not scram_active:                                                 # only allow movement when running
+        if selected_lever is not None and lever_active[selected_lever]:               # if lever selected
+            if keys[pygame.K_UP]:                                                     # up arrow
+                lever_positions[selected_lever] -= 1                                  # move lever up (adds +reactivity in this build)
+                lever_activation_time[selected_lever] = now                           # refresh timer
+                moved_this_frame = True                                               # mark moved
+            elif keys[pygame.K_DOWN]:                                                 # down arrow
+                lever_positions[selected_lever] += 1                                  # move lever down (adds -reactivity in this build)
+                lever_activation_time[selected_lever] = now                           # refresh timer
+                moved_this_frame = True                                               # mark moved
+            lever_positions[selected_lever] = max(LEVER_TRACK_TOP,                    # clamp top
+                                                  min(LEVER_TRACK_BOTTOM - LEVER_HEIGHT, lever_positions[selected_lever]))  # clamp bottom
+
+        if selected_dial is not None and dial_active[selected_dial]:                  # if dial selected
+            prev_det = dial_detent(dial_angles[selected_dial])                        # previous detent
+            if keys[pygame.K_LEFT]:                                                   # left arrow
+                dial_angles[selected_dial] -= 2                                       # rotate dial left
+                dial_activation_time[selected_dial] = now                             # refresh timer
+            elif keys[pygame.K_RIGHT]:                                                # right arrow
+                dial_angles[selected_dial] += 2                                       # rotate dial right
+                dial_activation_time[selected_dial] = now                             # refresh timer
+            new_det = dial_detent(dial_angles[selected_dial])                         # new detent
+            if new_det != prev_det:                                                   # inhibit only when detent changes
+                moved_this_frame = True                                               # mark moved
+
+    if moved_this_frame:                                                              # if any control moved
+        last_control_move_time = now                                                  # update inhibit timer
+
+    for i in range(NUM_LEVERS):                                                       # lever cooldown
+        if lever_active[i] and (now - lever_activation_time[i]) > COOLDOWN_TIME:      # if timed out
+            lever_active[i] = False                                                   # deactivate
+            if selected_lever == i:                                                   # if selected
+                selected_lever = None                                                 # clear selection
+
+    for i in range(NUM_DIALS):                                                        # dial cooldown
+        if dial_active[i] and (now - dial_activation_time[i]) > COOLDOWN_TIME:        # if timed out
+            dial_active[i] = False                                                    # deactivate
+            if selected_dial == i:                                                    # if selected
+                selected_dial = None                                                  # clear selection
+
+    if scram_active:                                                                  # if scram active
+        for i in range(NUM_LEVERS):                                                   # for each lever
+            lever_positions[i] = LEVER_TRACK_BOTTOM - LEVER_HEIGHT                    # force full down on SCRAM (shutdown end)
+
+    if scram_active and (now - scram_start_time > 3.0):                               # scram ends after 3 seconds
+        power_on = False                                                              # power off
+        scram_active = False                                                          # clear scram
+        scram_start_time = 0.0                                                        # clear timer
+        current_power = 0.0                                                           # power plot to 0
+        power_raw_display = 0.0                                                       # display power to 0
+        n = 1e-12                                                                     # reset n
+        C = 0.0                                                                       # reset C
+        rho_prev = 0.0                                                                # reset rho_prev
+        rho_new = 0.0                                                                 # reset rho_new
+        power_history.clear()                                                         # clear power history
+        ch2_history.clear()                                                           # clear CH2 history
+        ch3_history.clear()                                                           # clear CH3 history
+        ch2_period_s = float("inf")                                                   # reset period
+        ch2_ln_buf.clear()                                                            # clear period fit buffer
+        ch2_period_bad_time = 0.0                                                     # clear persistent-fast counter
+        lever_positions[:] = [LEVER_TRACK_BOTTOM - LEVER_HEIGHT] * NUM_LEVERS         # AFTER RESET: levers back to bottom start
+        dial_angles[0] = angle_from_detent(2)                                         # AFTER RESET: CH2 dial to startup detent
+        dial_angles[1] = angle_from_detent(1)                                         # AFTER RESET: CH3 dial to startup detent
+        selected_lever = None                                                         # clear selection
+        selected_dial = None                                                          # clear selection
+        lever_active[:] = [False] * NUM_LEVERS                                        # clear active flags
+        dial_active[:] = [False] * NUM_DIALS                                          # clear active flags
+        last_control_move_time = now                                                  # inhibit right after reset
+
+    if power_on and not scram_active:                                                 # run physics only when powered
+        rho_fine = 0.00310                                                            # fine rod worth magnitude
+        rho_coarse = 0.01250                                                          # coarse rod worth magnitude
+        lever_worths = [rho_fine, rho_fine, rho_fine, rho_coarse]                     # worth list
+        travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)                # travel distance
+        rho_new = 0.0                                                                 # reset rho sum
+
+        for i in range(NUM_LEVERS):                                                   # compute rho from lever positions
+            frac_in = (LEVER_TRACK_BOTTOM - LEVER_HEIGHT - lever_positions[i]) / travel if travel > 0.0 else 0.0  # UP = more insertion
+            frac_in = max(0.0, min(1.0, frac_in))                                     # clamp fraction
+            worth_fraction = rod_curve(frac_in)                                       # nonlinear worth
+            rho_new += (2.0 * worth_fraction - 1.0) * lever_worths[i]                 # bottom negative, top positive
+
+        RHO_POS_LIMIT = 0.95 * beta                                                   # positive rho limit (avoid prompt critical)
+        RHO_NEG_LIMIT = -0.2                                                          # negative rho limit
+        rho_new = max(RHO_NEG_LIMIT, min(RHO_POS_LIMIT, rho_new))                     # clamp rho
+
+        if abs(rho_new - rho_prev) > 1e-5:                                            # if rho changed
+            denom_j = (beta - rho_new)                                                # denom for jump
+            denom_j = denom_j if abs(denom_j) >= 1e-6 else (1e-6 if denom_j >= 0 else -1e-6)  # protect denom
+            raw_jump = (beta - rho_prev) / denom_j                                    # raw jump factor
+            raw_jump = max(0.8, min(1.2, raw_jump))                                   # clamp jump
+            jump_factor = 1.0 + 0.5 * (raw_jump - 1.0)                                # soften jump
+            n = max(1e-12, n * jump_factor)                                           # apply and clamp
+
+        substeps = 12                                                                 # rk substeps
+        dt_sub = dt / max(1, substeps)                                                # sub dt
+        for _ in range(substeps):                                                     # integrate substeps
+            n, C = rk4_step((n, C), dt_sub, rho_new)                                  # step
+            n = 1e-12 if (not (n == n) or n < 1e-12) else n                           # guard n NaN/neg
+            C = 0.0 if (not (C == C) or C < 0.0) else C                               # guard C NaN/neg
+
+        power_raw = max(0.0, P_SCALE * n)                                             # uncapped physical power
+        power_raw_display = power_raw                                                 # set display power uncapped
+        current_power = max(0.0, min(MAX_POWER, power_raw))                           # cap only for plot
+        power_history.append(current_power)                                           # append power history
+
+        ch2_I_true = max(I_FLOOR, I_PER_WATT_CH2 * power_raw)                         # true CH2 current from uncapped power
+        ch3_I_true = max(I_FLOOR, I_PER_WATT_CH3 * power_raw)                         # true CH3 current from uncapped power
+        ch2_I_ind = first_order_lag(ch2_I_ind, ch2_I_true, dt, CH2_TAU)               # filtered CH2 current
+        ch3_I_ind = first_order_lag(ch3_I_ind, ch3_I_true, dt, CH3_TAU)               # filtered CH3 current
+
+        lnI = math.log(max(ch2_I_ind, I_FLOOR))                                       # ln(I)
+        ch2_ln_buf.append((now, lnI))                                                 # append period sample
+        while len(ch2_ln_buf) > 0 and (now - ch2_ln_buf[0][0]) > CH2_PERIOD_FIT_WINDOW_S:  # keep last window
+            ch2_ln_buf.popleft()                                                      # pop old samples
+        ch2_period_s = fit_period_from_buffer(ch2_ln_buf)                             # fitted period
+
+        ch2_history.append(ch2_I_ind)                                                 # store CH2
+        ch3_history.append(ch3_I_ind)                                                 # store CH3
+
+        grace = (now - power_on_time) < SCRAM_GRACE_S                                 # startup grace inhibits channel scrams
+        moving_inhibit = (now - last_control_move_time) < CONTROL_MOVE_INHIBIT_S      # inhibit after movement
+
+        scram_trip = False                                                            # local scram trip flag
+
+        if (not grace) and (ch2_I_ind <= CH2_LOW_SCRAM_A):                            # CH2 low scram
+            scram_trip = True                                                         # set trip
+        if (not grace) and (ch2_I_ind >= CH2_HIGH_SCRAM_A):                           # CH2 high scram
+            scram_trip = True                                                         # set trip
+
+        if (not grace) and (not moving_inhibit) and (ch2_period_s != float("inf")):   # period scram check
+            if ch2_period_s <= CH2_PERIOD_SCRAM_S:                                    # fast rise condition
+                ch2_period_bad_time += dt                                             # accumulate bad time
+            else:                                                                     # otherwise
+                ch2_period_bad_time = max(0.0, ch2_period_bad_time - 2.0 * dt)        # decay faster than it accumulates
+        else:                                                                          # grace or inhibit
+            ch2_period_bad_time = 0.0                                                 # reset counter
+
+        if (not grace) and (not moving_inhibit) and (ch2_period_bad_time >= CH2_PERIOD_PERSIST_S):  # persistent condition
+            scram_trip = True                                                         # set trip
+
+        det3 = dial_detent(dial_angles[1])                                            # CH3 detent
+        ch3_log_max = CH3_LOG_MAX_AT_0 + det3                                         # CH3 top decade
+        ch3_log_min = ch3_log_max - CH3_LOG_SPAN_DECADES                              # CH3 bottom decade
+
+        logI3 = math.log10(max(ch3_I_ind, I_FLOOR))                                   # log10 current
+        frac3 = (logI3 - ch3_log_min) / max(1e-9, (ch3_log_max - ch3_log_min))        # window fraction
+        frac3 = max(0.0, min(1.0, frac3))                                             # clamp
+
+        if (not grace) and (ch3_I_ind > CH3_MAX_LOCKOUT_A):                           # CH3 lockout
+            ch3_hi_lockout = True                                                     # latch
+            scram_trip = True                                                         # set trip
+
+        if (not grace) and (not moving_inhibit) and ((frac3 <= CH3_LOW_PCT_SCRAM) or (frac3 >= CH3_HI_PCT_SCRAM)):  # CH3 window scram
+            scram_trip = True                                                         # set trip
+
+        if scram_trip:                                                                # if any scram condition
+            scram_active = True                                                       # trigger scram
+            scram_start_time = now                                                    # set scram time
+            selected_lever = None                                                     # clear selection
+            selected_dial = None                                                      # clear selection
+            lever_active[:] = [False] * NUM_LEVERS                                    # clear lever actives
+            dial_active[:] = [False] * NUM_DIALS                                      # clear dial actives
+
+        rho_prev = rho_new                                                            # update rho_prev
+
+    else:                                                                             # if not powered
+        ch2_I_ind = first_order_lag(ch2_I_ind, I_FLOOR, dt, 0.5)                      # relax CH2
+        ch3_I_ind = first_order_lag(ch3_I_ind, I_FLOOR, dt, 0.5)                      # relax CH3
+        ch2_period_s = float("inf")                                                   # hide period when off
+        ch2_ln_buf.clear()                                                            # clear buffer
+        ch2_period_bad_time = 0.0                                                     # clear persistence timer
+
+    pygame.draw.rect(screen, GREY, (GRAPH_X, GRAPH_Y, GRAPH_WIDTH, GRAPH_HEIGHT))     # graph background
+    linear_width = GRAPH_WIDTH // 2                                                   # half width
+    right_start  = GRAPH_X + linear_width                                             # right start x
+
+    if len(ch2_history) > 1 and len(ch3_history) > 1:                                 # if history exists
+        npts = min(len(ch2_history), len(ch3_history))                                # match length
+        ch2_list = list(ch2_history)[-npts:]                                          # CH2 list
+        ch3_list = list(ch3_history)[-npts:]                                          # CH3 list
+
+        det2 = dial_detent(dial_angles[0])                                            # CH2 detent
+        fs2 = CH2_RANGES[det2 + 3]                                                    # CH2 FS
+
+        pts = []                                                                      # CH2 points
+        for i, I in enumerate(ch2_list):                                              # loop
+            y = GRAPH_Y + (i / max(1, npts - 1)) * GRAPH_HEIGHT                       # y mapping
+            frac = max(0.0, min(1.0, I / max(fs2, I_FLOOR)))                          # fraction of FS
+            x = GRAPH_X + frac * linear_width                                         # x mapping
+            pts.append((x, y))                                                        # append point
+        pygame.draw.lines(screen, RED, False, smooth_points(pts, steps=6), 2)         # draw CH2 line
+
+        det3 = dial_detent(dial_angles[1])                                            # CH3 detent
+        ch3_log_max = CH3_LOG_MAX_AT_0 + det3                                         # CH3 top
+        ch3_log_min = ch3_log_max - CH3_LOG_SPAN_DECADES                              # CH3 bottom
+
+        log_pts = []                                                                  # CH3 points
+        for i, I in enumerate(ch3_list):                                              # loop
+            y = GRAPH_Y + (i / max(1, npts - 1)) * GRAPH_HEIGHT                       # y mapping
+            logI = math.log10(max(I, I_FLOOR))                                        # log current
+            frac = (logI - ch3_log_min) / max(1e-9, (ch3_log_max - ch3_log_min))      # frac in window
+            frac = max(0.0, min(1.0, frac))                                           # clamp
+            x = right_start + frac * linear_width                                     # x mapping
+            log_pts.append((x, y))                                                    # append
+        pygame.draw.lines(screen, YELLOW, False, log_pts, 2)                          # draw CH3 line
+
+    pygame.draw.rect(screen, BLACK, (GRAPH_X, GRAPH_Y, linear_width, GRAPH_HEIGHT), 2)      # CH2 border
+    pygame.draw.rect(screen, BLACK, (right_start, GRAPH_Y, linear_width, GRAPH_HEIGHT), 2) # CH3 border
+    pygame.draw.line(screen, BLACK, (right_start, GRAPH_Y), (right_start, GRAPH_Y + GRAPH_HEIGHT), 2)  # split line
+
+    font = pygame.font.SysFont(None, 30)                                              # main font
+    inst_font = pygame.font.SysFont(None, 20)                                         # instrument font
+    title_font = pygame.font.SysFont(None, 20)                                        # title font
+
+    det2 = dial_detent(dial_angles[0])                                                # CH2 detent
+    fs2 = CH2_RANGES[det2 + 3]                                                        # CH2 FS
+    ch2_info = inst_font.render(f"CH2 (LIN): I={format_amps(ch2_I_ind)}  FS={format_amps(fs2)}", True, BLACK)  # CH2 info
+    screen.blit(ch2_info, (GRAPH_X, GRAPH_Y - 86))                                    # blit CH2 info
+
+    per_str = "—" if (not power_on) else ("∞" if ch2_period_s == float("inf") else f"{ch2_period_s:.1f}s")  # period string
+    per_info = inst_font.render(f"CH2 Period: {per_str}   (scram @ {CH2_PERIOD_SCRAM_S:.0f}s)", True, BLACK)  # period line
+    screen.blit(per_info, (GRAPH_X, GRAPH_Y - 62))                                    # blit period info
+
+    det3 = dial_detent(dial_angles[1])                                                # CH3 detent
+    ch3_log_max = CH3_LOG_MAX_AT_0 + det3                                             # CH3 top decade
+    ch3_log_min = ch3_log_max - CH3_LOG_SPAN_DECADES                                  # CH3 bottom decade
+    ch3_info = inst_font.render(f"CH3 (LOG): I={format_amps(ch3_I_ind)}  window=10^{int(ch3_log_min)}..10^{int(ch3_log_max)} A", True, BLACK)  # CH3 info
+    screen.blit(ch3_info, (GRAPH_X, GRAPH_Y - 38))                                    # blit CH3 info
+
+    k_eff = 1.0 / max(1e-9, (1.0 - rho_new))                                          # k_eff from rho definition
+    dollars = rho_new / beta                                                          # dollars from rho/beta
+
+    p_text = font.render(f"Power (display): {power_raw_display:.2f} W", True, BLACK)  # power display text
+    screen.blit(p_text, p_text.get_rect(center=(GRAPH_X + GRAPH_WIDTH // 2, GRAPH_Y - 112)))  # blit power display
+
+    k_text = inst_font.render(f"k_eff: {k_eff:.6f}   ρ: {rho_new:+.6f}   $: {dollars:+.2f}", True, BLACK)  # k_eff line
+    screen.blit(k_text, k_text.get_rect(center=(GRAPH_X + GRAPH_WIDTH // 2, GRAPH_Y - 92)))   # blit k_eff line
+
+    linear_label = title_font.render("Channel 2 (Linear Current)", True, BLACK)       # CH2 title
+    screen.blit(linear_label, linear_label.get_rect(center=(GRAPH_X + linear_width // 2, GRAPH_Y - 18)))  # blit CH2 title
+    log_label = title_font.render("Channel 3 (Log Current)", True, BLACK)             # CH3 title
+    screen.blit(log_label, log_label.get_rect(center=(right_start + linear_width // 2, GRAPH_Y - 18)))     # blit CH3 title
+
+    y_label = font.render("Time (index)", True, BLACK)                                # y axis label
+    y_label = pygame.transform.rotate(y_label, 90)                                    # rotate label
+    screen.blit(y_label, y_label.get_rect(center=(GRAPH_X - 70, GRAPH_Y + GRAPH_HEIGHT // 2)))  # blit y label
+
+    draw_ticks_and_labels()                                                           # draw ticks
+
+    pygame.draw.rect(screen, GREEN if power_on else GREY, power_button_rect)          # draw power button
+    btn_label = font.render("POWER", True, BLACK)                                     # power label
+    screen.blit(btn_label, btn_label.get_rect(center=power_button_rect.center))       # blit power label
+
+    pygame.draw.rect(screen, SCRAM_RED if scram_active else GREY, scram_button_rect)  # draw scram square
+    scram_text = font.render("SCRAM", True, BLACK)                                    # scram text
+    screen.blit(scram_text, scram_text.get_rect(center=(scram_button_rect.centerx, scram_button_rect.bottom + 30)))  # blit scram label
+
+    for i in range(NUM_LEVERS):                                                       # draw levers
+        x = lever_x_positions[i]                                                      # lever x
+        y = lever_positions[i]                                                        # lever y
+        pygame.draw.rect(screen, GREY, (x - 6, LEVER_TRACK_TOP, 12, LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP))  # track
+        handle_color = LEVER_INACTIVE_COLOR if (scram_active or not power_on) else (YELLOW if lever_active[i] else BLUE)  # handle color
+        pygame.draw.rect(screen, handle_color, (x - 14, y, 28, LEVER_HEIGHT))         # handle
+        name = font.render(lever_names[i], True, BLACK)                               # label
+        screen.blit(name, name.get_rect(center=(x, LEVER_TRACK_BOTTOM + 34)))         # blit label
+
+    scale_x = lever_x_positions[-1] + 95                                              # reactivity scale x
+    scale_top = LEVER_TRACK_TOP                                                       # reactivity scale top
+    scale_bot = LEVER_TRACK_BOTTOM                                                    # reactivity scale bottom
+    pygame.draw.line(screen, BLACK, (scale_x, scale_top), (scale_x, scale_bot), 3)    # draw scale line
+
+    plus_lbl = font.render("+", True, BLACK)                                          # plus label
+    minus_lbl = font.render("-", True, BLACK)                                         # minus label
+    screen.blit(plus_lbl, plus_lbl.get_rect(center=(scale_x + 26, scale_top - 16)))   # plus at top
+    screen.blit(minus_lbl, minus_lbl.get_rect(center=(scale_x + 26, scale_bot + 16))) # minus at bottom
+
+    react_lbl = font.render("Reactivity", True, BLACK)                                # reactivity label
+    screen.blit(react_lbl, react_lbl.get_rect(midleft=(scale_x + 48, (scale_top + scale_bot) // 2)))  # blit label
+
+    rho_span = (0.95 * beta) - (-0.2)                                                 # span for pointer mapping
+    rho_frac = (rho_new - (-0.2)) / max(1e-9, rho_span)                               # normalized rho fraction
+    rho_frac = max(0.0, min(1.0, rho_frac))                                           # clamp fraction
+    pointer_y = scale_bot - rho_frac * (scale_bot - scale_top)                        # pointer y
+    pygame.draw.circle(screen, BLACK, (scale_x, int(pointer_y)), 6)                   # pointer dot
+
+    for i in range(NUM_DIALS):                                                        # draw dials
+        cx, cy = dial_centers[i]                                                      # center
+        pygame.draw.circle(screen, GREY, (cx, cy), DIAL_RADIUS + 8)                   # bezel
+        face_color = DIAL_INACTIVE_COLOR if not power_on else (YELLOW if dial_active[i] else DIAL_INACTIVE_COLOR)  # face color
+        pygame.draw.circle(screen, face_color, (cx, cy), DIAL_RADIUS)                 # face circle
+        draw_dial_ticks(cx, cy, DIAL_RADIUS)                                          # ticks
+        angle_rad = math.radians(dial_angles[i])                                      # pointer angle
+        line_x = cx + DIAL_RADIUS * math.cos(angle_rad)                               # pointer x
+        line_y = cy + DIAL_RADIUS * math.sin(angle_rad)                               # pointer y
+        pygame.draw.line(screen, WHITE, (cx, cy), (line_x, line_y), 4)                # pointer line
+        cap = font.render(dial_names[i], True, BLACK)                                 # caption
+        screen.blit(cap, cap.get_rect(center=(cx, cy - DIAL_RADIUS - 52)))            # blit caption
+
+    pygame.display.flip()                                                             # update display
+    clock.tick(60)                                                                    # limit to 60 FPS
+
+pygame.quit()                                                                         # quit pygame
+sys.exit()                                                                            # exit program
