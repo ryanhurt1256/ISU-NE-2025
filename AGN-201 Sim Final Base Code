@@ -134,6 +134,7 @@ last_control_move_time = 0.0                                                    
 scram_button_rect = pygame.Rect(70, LEVER_TRACK_TOP + 40, 90, 90)                    # SCRAM button rectangle for mouse clicks
 
 LEVER_SPEED_PX = 1                                                                   # lever move speed per frame (pixels/frame)
+ROD_SPEED_PX_S = 120.0                                                               # coarse rod travel speed limit (pixels/second) tune for realism
 
 def first_order_lag(y, x, dt, tau):                                                  # compute 1st-order lag filter output
     if tau <= 1e-6:                                                                  # if tau is ~0, filtering is unnecessary
@@ -196,7 +197,7 @@ def draw_dial_ticks(cx, cy, radius):                                            
         screen.blit(label, label.get_rect(center=(label_x, label_y)))                # blit label centered at computed position
 
 def reset_instruments_to_power(P_watts):                                             # reset instrument states to match a given power
-    global ch2_I_ind, ch3_I_ind, ch2_period_s, ch3_hi_lockout                         # declare globals modified in this function
+    global ch2_I_ind, ch3_I_ind, ch2_period_s, ch3_hi_lockout                        # declare globals modified in this function
     global ch2_ln_buf, ch2_period_bad_time                                           # declare additional globals modified
     ch2_I_ind = max(I_FLOOR, I_PER_WATT_CH2 * max(0.0, P_watts))                     # initialize CH2 indicated current from power
     ch3_I_ind = max(I_FLOOR, I_PER_WATT_CH3 * max(0.0, P_watts))                     # initialize CH3 indicated current from power
@@ -227,6 +228,10 @@ def rk4_step(state, dt_sub, rho):                                               
     return n_new, C_new                                                              # return updated (n, C)
 
 BAUDRATE = 115200                                                                    # set serial baud rate (must match microcontroller)
+SERIAL_TIMEOUT_S = 0.25                                                              # seconds until MCU considered “offline” (no packets)
+last_serial_rx_time = 0.0                                                            # last time a valid serial packet was received (seconds)
+last_serial_controls = None                                                          # last valid control packet (cached)
+prev_power_sw = False                                                                # previous Arduino power switch state (edge detect)
 
 def setup_serial(port, baud=BAUDRATE):                                               # open serial connection to given device path
     if serial is None:                                                               # if pyserial is unavailable
@@ -239,12 +244,12 @@ def setup_serial(port, baud=BAUDRATE):                                          
         return None                                                                  # return None to continue without serial
 
 ser = None                                                                           # initialize serial handle as None (disconnected)
-for port in ("/dev/ttyUSB0", "/dev/ttyACM0", "/dev/serial0"):                        # try common Raspberry Pi serial device names
+for port in ("/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/serial0"): # try common Pi device names
     ser = setup_serial(port)                                                         # attempt to connect on this port
     if ser is not None:                                                              # if connection succeeded
         break                                                                        # stop trying more ports
 
-def read_controls_from_serial(ser):                                                  # read and parse one line of control data
+def read_controls_from_serial(ser):                                                  # read and parse one line of control data (new 5-field packet)
     if ser is None:                                                                  # if serial is not connected
         return None                                                                  # return None to indicate no update
     try:                                                                             # try reading and parsing the line
@@ -252,13 +257,20 @@ def read_controls_from_serial(ser):                                             
         if not raw:                                                                  # if line is empty (no data)
             return None                                                              # return None to indicate no update
         parts = raw.split(",")                                                       # split comma-separated values into fields
-        if len(parts) < 6:                                                           # require at least 6 fields (legacy format still supported)
+        if len(parts) < 5:                                                           # require 5 fields: rod,ch2_det,ch3_det,power,scram
             return None                                                              # reject malformed packet
-        rods = [float(p) for p in parts[:4]]                                         # parse rod fractions (expected 0.0..1.0)
-        power_sw = bool(int(float(parts[4])))                                        # parse power switch as boolean (0/1)
-        scram_sw = bool(int(float(parts[5])))                                        # parse scram switch as boolean (0/1)
-        coarse = rods[3] if len(rods) >= 4 else 0.0                                  # extract coarse rod fraction safely (legacy)  # coarse-only
-        return coarse, power_sw, scram_sw                                            # return coarse-only value plus switches  # coarse-only
+
+        coarse = float(parts[0])                                                     # parse coarse rod fraction (0.0..1.0)
+        ch2_det = int(float(parts[1]))                                               # parse CH2 detent (-3..+3)
+        ch3_det = int(float(parts[2]))                                               # parse CH3 detent (-3..+3)
+        power_sw = bool(int(float(parts[3])))                                        # parse power switch as boolean (0/1)
+        scram_sw = bool(int(float(parts[4])))                                        # parse scram switch as boolean (0/1)
+
+        coarse = max(0.0, min(1.0, coarse))                                          # clamp rod fraction to [0,1]
+        ch2_det = max(-3, min(3, ch2_det))                                           # clamp CH2 detent to [-3,+3]
+        ch3_det = max(-3, min(3, ch3_det))                                           # clamp CH3 detent to [-3,+3]
+
+        return coarse, ch2_det, ch3_det, power_sw, scram_sw                          # return all parsed controls
     except Exception:                                                                # ignore any parse/IO errors safely
         return None                                                                  # return None on error to avoid crashing
 
@@ -334,14 +346,59 @@ while running:                                                                  
         dt = 0.1                                                                     # set maximum dt
     last_time = now                                                                  # update last_time for next frame
 
+    # --- Serial input (Arduino): coarse rod, CH2/CH3 detents, power, scram ---
     serial_controls = read_controls_from_serial(ser)                                 # read one serial packet (if available)
-    if serial_controls:                                                              # if a valid packet was parsed
-        coarse_frac, power_sw, scram_sw = serial_controls                            # unpack coarse rod fraction and switches  # coarse-only
-        travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)               # compute lever travel distance (pixels)
-        frac = max(0.0, min(1.0, float(coarse_frac)))                                # clamp coarse rod fraction to [0,1]  # coarse-only
-        lever_positions[0] = LEVER_TRACK_TOP + frac * travel                         # map fraction -> single lever y position  # coarse-only
+    if serial_controls is not None:                                                  # if a valid packet was parsed
+        last_serial_rx_time = now                                                    # mark MCU as alive (heartbeat timestamp)
+        last_serial_controls = serial_controls                                        # cache last good packet for smooth control
 
-        if power_sw and not power_on:                                                # detect power switch rising edge
+    serial_live = (now - last_serial_rx_time) <= SERIAL_TIMEOUT_S                    # True if packets are recent (MCU alive)
+
+    if not serial_live:                                                              # if MCU is offline (heartbeat expired)
+        last_serial_controls = None                                                  # drop cached packet to prevent stale reuse
+        prev_power_sw = False                                                        # reset edge detect so reconnect is clean
+
+    if last_serial_controls is not None and serial_live:                             # use cached packet while MCU is alive
+        coarse_frac, ch2_det, ch3_det, power_sw, scram_sw = last_serial_controls     # unpack cached rod + dials + switches
+
+        prev_lever_y = lever_positions[0]                                            # store previous lever position before applying serial
+        prev_d2 = dial_detent(dial_angles[0])                                        # store previous CH2 detent before applying serial
+        prev_d3 = dial_detent(dial_angles[1])                                        # store previous CH3 detent before applying serial
+
+        travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)               # compute lever travel distance (pixels)
+        frac = max(0.0, min(1.0, float(coarse_frac)))                                # clamp coarse rod fraction to [0,1]
+        target_y = LEVER_TRACK_TOP + frac * travel                                   # commanded lever y position from Arduino
+        max_step = ROD_SPEED_PX_S * dt                                               # per-frame max motion from speed limit
+        dy = target_y - lever_positions[0]                                           # error between commanded and actual
+        if abs(dy) <= max_step:                                                      # if within one step
+            lever_positions[0] = target_y                                            # snap to target
+        else:                                                                        # otherwise move toward target at limited speed
+            lever_positions[0] += max_step * (1.0 if dy > 0 else -1.0)               # step toward target
+
+        lever_positions[0] = max(                                                    # final hard clamp for hardware safety
+            LEVER_TRACK_TOP,                                                         # prevent lever from exceeding upper travel limit
+            min(LEVER_TRACK_BOTTOM - LEVER_HEIGHT,                                   # prevent lever from exceeding lower travel limit
+                lever_positions[0])                                                  # current lever position
+        )
+
+        dial_angles[0] = angle_from_detent(ch2_det)                                  # set CH2 dial angle directly from detent
+        dial_angles[1] = angle_from_detent(ch3_det)                                  # set CH3 dial angle directly from detent
+
+        new_d2 = dial_detent(dial_angles[0])                                         # compute new CH2 detent after applying serial
+        new_d3 = dial_detent(dial_angles[1])                                         # compute new CH3 detent after applying serial
+
+        lever_moved = abs(lever_positions[0] - prev_lever_y) >= 2.0                  # ignore 1-px jitter from ADC noise
+        dial_changed = (new_d2 != prev_d2) or (new_d3 != prev_d3)                    # treat detent change as dial movement
+
+        if lever_moved or dial_changed:                                              # only inhibit scrams if a control actually moved
+            last_control_move_time = now                                             # update inhibit timestamp
+            
+        #after a SCRAM shutdown, hardware POWER must be toggled OFF->ON to restart (intentional edge behavior)
+        power_rise = (power_sw and not prev_power_sw)                                # rising edge: OFF -> ON
+        power_fall = ((not power_sw) and prev_power_sw)                              # falling edge: ON -> OFF (treat as SCRAM)
+        prev_power_sw = power_sw                                                     # save state for next frame edge detect
+
+        if power_rise and (not power_on):                                            # turn on only once per toggle
             power_on = True                                                          # set power state to on
             power_on_time = now                                                      # record power-on timestamp
             scram_active = False                                                     # clear SCRAM state
@@ -350,19 +407,18 @@ while running:                                                                  
             power_raw_display = 1.0                                                  # initialize uncapped power display to 1 W
             n = max(1e-12, current_power / P_SCALE)                                  # initialize neutron population from power
             C = (beta / (Lambda * lam)) * n                                          # initialize precursor at steady-state for n
-            dial_angles[0] = angle_from_detent(2)                                    # set CH2 dial to startup detent +2
-            dial_angles[1] = angle_from_detent(1)                                    # set CH3 dial to startup detent +1
             reset_instruments_to_power(current_power)                                # reset instrument histories and states
             power_history.clear()                                                    # clear power plot history
             last_control_move_time = now                                             # inhibit scrams immediately after power-on
 
-        if (not power_sw) and power_on:                                              # detect power switch falling edge while on
+        if power_fall and power_on and not scram_active:                             # power off behaves like SCRAM (edge only)
             scram_active = True                                                      # trigger SCRAM state
             scram_start_time = now                                                   # record SCRAM start time
 
-        if scram_sw:                                                                 # if external SCRAM switch is asserted
+        if scram_sw and not scram_active:                                            # if external SCRAM switch is asserted
             scram_active = True                                                      # trigger SCRAM state
             scram_start_time = now                                                   # record SCRAM start time
+
 
     for event in pygame.event.get():                                                 # poll and handle pygame events
         if event.type == pygame.QUIT:                                                # if window close is requested
