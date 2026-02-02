@@ -180,6 +180,8 @@ SERIAL_TIMEOUT_S = 0.25                                                         
 last_serial_rx_time = 0.0                                                           # timestamp of last received serial line
 last_serial_controls = None                                                         # last parsed controls tuple
 prev_power_sw = False                                                               # previous power switch state (for edge detect)
+serial_was_live = False                                                             # serial reacquired guard for first packet edge
+
 
 def clamp(v, lo, hi):                                                               # define a clamp helper
     return lo if v < lo else hi if v > hi else v                                    # return v clamped to [lo, hi]
@@ -406,6 +408,11 @@ while running:                                                                  
     if not serial_live:                                                            # if serial has timed out
         last_serial_controls = None                                                 # clear controls so UI doesn't keep stale input
         #prev_power_sw = False                                                       # reset edge detector to avoid false rise. commented out for glitch in false OFF --> ON edge
+    
+    if serial_live and (not serial_was_live) and (last_serial_controls is not None): # detect serial recconect and resynchronize power switch state
+        _, _, _, power_sw_sync, _ = last_serial_controls                             # force previous power switch to match the actual
+        prev_power_sw = power_sw_sync                                                # hardware state so artificial edge is not detected
+    serial_was_live = serial_live                                                    #record serial state for next frame comparison
 
     if last_serial_controls is not None and serial_live:                            # if we have fresh serial controls
         fine_frac, ch2_det, ch3_det, power_sw, scram_sw = last_serial_controls      # unpack parsed control values
