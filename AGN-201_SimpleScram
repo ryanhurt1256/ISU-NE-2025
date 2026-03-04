@@ -1,4 +1,4 @@
-# AGN-201 Simulation5.0.py
+# AGN-201 Simulation5.1.py
 #
 # PURPOSE
 # -------
@@ -25,8 +25,8 @@
 #
 # FCR MAPPING
 # -----------
-# Rod inserted (down) → more negative ρ
-# Rod withdrawn (up)  → less negative / more positive ρ
+# Rod withdrawn (down) → more negative ρ
+# Rod inserted (up)  → less negative / more positive ρ
 #
 # SERIAL INPUT FORMAT (optional)
 # ------------------------------
@@ -45,6 +45,7 @@ import sys                        # sys.exit() for clean termination
 import math                       # math for trig/log10/hypot conversions and geometry
 import time                       # time.time() for wall-clock dt and scram timing
 import collections                # collections.deque for fixed-length plot histories
+import socket                     # Bluetooth RFCOMM
 
 # ---------- OPTIONAL SERIAL ----------
 try:
@@ -135,8 +136,10 @@ FCR_CURVE_POINTS_CM_PCT = [       # (cm_inserted, %total_worth_inserted) points 
 # =========================
 pygame.init()                     # initialize all Pygame subsystems (display, font, input, etc.)
 
-WIDTH, HEIGHT = 1700, 1200        # window pixel size
-screen = pygame.display.set_mode((WIDTH, HEIGHT))  # create window surface
+#WIDTH, HEIGHT = 1700, 1200        # window pixel size
+#screen = pygame.display.set_mode((WIDTH, HEIGHT))  # create window surface
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN) # Use native display resolution (important for Raspberry Pi deployment)
+WIDTH, HEIGHT = screen.get_size() # window pixel size of display being used
 pygame.display.set_caption("Control Panel (FCR) — CH2 LOG + CH3 LIN")  # window title
 clock = pygame.time.Clock()       # FPS timing controller (used with clock.tick)
 
@@ -152,15 +155,15 @@ DIAL_INACTIVE_COLOR  = (50, 50, 50)    # dial face color when idle
 LEVER_INACTIVE_COLOR = (80, 80, 80)    # lever handle color when inactive / disabled
 
 # ---------- BASE LAYOUT ----------
-MARGIN_LEFT, MARGIN_RIGHT, MARGIN_BOTTOM = 170, 160, 40  # margins; bottom mostly reserved for toggle tab
+MARGIN_LEFT, MARGIN_RIGHT, MARGIN_BOTTOM = 30, 30, 20  # margins; bottom mostly reserved for toggle tab
 
-GRAPH_TOP  = 20                 # top padding above header/graph stack
-HEADER_H   = 120                # vertical space reserved for header text
+GRAPH_TOP  = 10                 # top padding above header/graph stack
+HEADER_H   = 100                # vertical space reserved for header text
 GRAPH_X    = MARGIN_LEFT        # left edge of plot region
 GRAPH_Y    = GRAPH_TOP + HEADER_H   # top of plot region (below header)
 GRAPH_WIDTH  = WIDTH - MARGIN_LEFT - MARGIN_RIGHT  # usable horizontal plot width
 
-BASE_GRAPH_HEIGHT = 340         # default plot height when controls are visible
+BASE_GRAPH_HEIGHT = int(HEIGHT * 0.45)  # default plot height when controls are visible
 TOGGLE_H = 30                   # height of collapse/expand “Controls” tab
 TOGGLE_GAP = 8                  # gap between graph region and the toggle tab
 
@@ -175,14 +178,14 @@ right_start  = GRAPH_X + linear_width  # x origin for the right-hand plot
 # Lever geometry (one lever)
 LEVER_TRACK_TOP    = 0           # y (px) of lever track top; computed in update_layout
 LEVER_TRACK_BOTTOM = 0           # y (px) of lever track bottom; computed in update_layout
-LEVER_HEIGHT       = 95          # lever handle height (px)
+LEVER_HEIGHT       = 70          # lever handle height (px)
 LEVER_X            = GRAPH_X + GRAPH_WIDTH // 2  # lever centered under plots
 lever_y            = 0           # current lever handle y-position (px); updated later
 lever_name = "Fine CR"           # label shown under lever
 
 # Dials
 NUM_DIALS   = 2                  # number of dials (CH2 and CH3)
-DIAL_RADIUS = 48                 # dial radius (px)
+DIAL_RADIUS = 38                 # dial radius (px)
 dial_centers = [(0, 0), (0, 0)]  # dial center positions; computed in update_layout
 dial_names  = ["CH2 Range (LOG)", "CH3 Range (LIN)"]  # labels
 dial_detents = [0, 0]            # dial detents (integers -3..+3), applied to CH2 and CH3
@@ -190,7 +193,8 @@ dial_detents = [0, 0]            # dial detents (integers -3..+3), applied to CH
 # Buttons
 button_width, button_height = 120, 55   # size for POWER button
 power_on = False                        # system “powered” state; gates physics updates
-POWER_RECT = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  # POWER button rectangle
+#POWER_RECT = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  # POWER button rectangle
+POWER_RECT = pygame.Rect(0, 0, button_width, button_height)  # placeholder; real position set in update_layout()
 SCRAM_RECT = pygame.Rect(70, 0, 90, 90)  # SCRAM button rectangle; y fixed in update_layout
 
 # Toggle tab rect (updated in layout)
@@ -255,6 +259,33 @@ def setup_serial():
     return None                   # no port found
 
 ser = setup_serial()              # attempt to open serial once at startup
+# =========================
+# BLUETOOTH SEND (Pi #1 -> Pi #2)
+# =========================
+# Streams simulation time and neutron state to a second Raspberry Pi via Bluetooth RFCOMM.
+
+BT_ADDR = "AA:BB:CC:DD:EE:FF"   # Bluetooth MAC address of the receiving Raspberry Pi NEEDS TO BE ADJUSTED FOR BLUETOOTH DEVICE
+BT_CH = 1                       # RFCOMM channel number (must match receiver) NEEDS TO BE ADJUSTED
+BT_HZ = 20                      # Data transmission rate (messages per second)
+
+bt_sock = None                  # Bluetooth socket object (None until connection established)
+bt_last_send = 0.0              # Timestamp of last transmitted message
+bt_next_retry = 0.0             # next time to attempt a Bluetooth connect
+BT_RETRY_S = 1.5                # wait this long between connection attempts (prevents frame-freeze spam)
+BT_STARTUP_DELAY_S = 1.0         # wait this long after program start before first BT connect attempt
+bt_enable_time = time.time() + BT_STARTUP_DELAY_S  # earliest wall-time when BT is allowed to connect
+
+def bt_connect():
+    """Create and connect a Bluetooth RFCOMM socket (short timeout so it never stalls the GUI)."""
+    s = socket.socket(                   # Create Bluetooth socket
+        socket.AF_BLUETOOTH,             # Bluetooth protocol family
+        socket.SOCK_STREAM,              # Stream socket (serial-like)
+        socket.BTPROTO_RFCOMM            # RFCOMM protocol
+    )
+    s.settimeout(0.35)                   # IMPORTANT: prevents connect() from freezing the UI loop
+    s.connect((BT_ADDR, BT_CH))          # Connect to receiver Pi (can raise timeout/OS errors)
+    s.settimeout(0.20)                   # Return socket to blocking mode for send()
+    return s                             # Return connected socket
 
 def read_controls_from_serial(ser_obj):
     if ser_obj is None:           # if no serial object, no data
@@ -448,7 +479,7 @@ def update_layout(collapsed):
     """
     global GRAPH_HEIGHT, linear_width, right_start
     global LEVER_TRACK_TOP, LEVER_TRACK_BOTTOM, lever_y
-    global SCRAM_RECT, dial_centers, TOGGLE_RECT
+    global SCRAM_RECT, POWER_RECT, dial_centers, TOGGLE_RECT
 
     xw = lever_withdrawn_fraction(lever_y) if LEVER_TRACK_TOP != 0 else 0.0  # preserve lever fraction during relayout
 
@@ -466,11 +497,13 @@ def update_layout(collapsed):
         GRAPH_WIDTH, TOGGLE_H
     )
 
-    LEVER_TRACK_TOP    = GRAPH_Y + GRAPH_HEIGHT + 95  # lever track starts below graph region
-    LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 270        # lever track length fixed
+    LEVER_TRACK_TOP    = GRAPH_Y + GRAPH_HEIGHT + 50  # lever track starts below graph region
+    LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 200        # lever track length fixed
     lever_y = lever_y_from_withdrawn(xw)              # restore lever y for preserved withdrawn fraction
 
     SCRAM_RECT = pygame.Rect(70, LEVER_TRACK_TOP + 40, 90, 90)  # SCRAM button follows lever location
+
+    POWER_RECT = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  # keep POWER BUTTON at bottom-left using current fullscreen HEIGHT
 
     dial_spacing = GRAPH_WIDTH // (NUM_DIALS + 1)     # spacing for dials across width
     dial_centers = [                                  # dial centers follow lever track bottom
@@ -520,9 +553,13 @@ while running:
             start_scram("EXTERNAL SCRAM", now)         # enter SCRAM sequence
 
     # ---------- EVENTS ----------
-    for event in pygame.event.get():                  # process Pygame event queue
-        if event.type == pygame.QUIT:                 # window close button
-            running = False                           # exit loop
+    for event in pygame.event.get():                  # process Pygame event queue (for windowed mode)
+        if event.type == pygame.QUIT:                 # window close button (for windowed mode)
+            running = False                           # exit loop (for windowed mode)
+
+        elif event.type == pygame.KEYDOWN:            # ESC key exits fullscreen
+            if event.key == pygame.K_ESCAPE:          # window close execute
+                running = False                       # exit loop
 
         elif event.type == pygame.MOUSEBUTTONDOWN:    # mouse click
             mx, my = event.pos                        # mouse coordinates (px)
@@ -700,6 +737,31 @@ while running:
         ch2_I_ind = first_order_lag(ch2_I_ind, I_FLOOR, dt, 0.5)  # decay indication toward floor when off/scram
         ch3_I_ind = first_order_lag(ch3_I_ind, I_FLOOR, dt, 0.5)
 
+    # ---------- BLUETOOTH DATA STREAM ----------
+    # Sends current simulation time and neutron state to the second Pi without ever stalling the GUI
+    # Try to connect only occasionally (NOT every frame), and never block the loop for long
+    if bt_sock is None:
+        if now >= bt_enable_time and now >= bt_next_retry: # only attempt connection at a controlled rate
+            bt_next_retry = now + BT_RETRY_S              # schedule the next allowed retry time
+            try:
+                bt_sock = bt_connect()                    # attempt to connect (has short timeout)
+            except Exception:
+                bt_sock = None                            # stay disconnected; try again in soon
+
+    if bt_sock is not None:
+        if (now - bt_last_send) >= (1.0 / BT_HZ):         # If connected, send at BT_HZ and send at a fixed rate
+            bt_last_send = now
+            try:
+                line = f"{sim_time_s:.4f},{n:.6e}\n"      # Format: sim_time_s, n
+                bt_sock.send(line.encode("utf-8"))        # transmit
+            except Exception:
+                try:
+                    bt_sock.close()                       # close broken socket
+                except Exception:
+                    pass
+                bt_sock = None                            # force reconnect path next time
+                bt_next_retry = now + BT_RETRY_S          # back off before retrying
+
     # =========================
     # DRAW PLOTS
     # =========================
@@ -716,7 +778,7 @@ while running:
         pts = []                               # list of polyline points
         L = len(ch2_history)                   # number of samples
         for i, I in enumerate(ch2_history):    # iterate history
-            y = GRAPH_Y + (i / max(1, L - 1)) * GRAPH_HEIGHT  # map sample index → vertical position (time axis)
+            y = GRAPH_Y + (1.0 - i / max(1, L - 1)) * GRAPH_HEIGHT  # map sample index → vertical position (time axis)
             logI = math.log10(max(I, I_FLOOR)) # convert current to log10, clamp to avoid log(0)
             frac = (logI - ch2_log_min) / max(1e-9, (ch2_log_max - ch2_log_min)) # normalize into [0,1] window
             frac = clamp(frac, 0.0, 1.0)       # clamp inside the window
@@ -731,7 +793,7 @@ while running:
         pts = []                               # list of polyline points
         L = len(ch3_history)                   # number of samples
         for i, I in enumerate(ch3_history):    # iterate history
-            y = GRAPH_Y + (i / max(1, L - 1)) * GRAPH_HEIGHT  # map sample index → vertical position
+            y = GRAPH_Y + (1.0 - i / max(1, L - 1)) * GRAPH_HEIGHT  # map sample index → vertical position
             frac = clamp(I / max(fs3, I_FLOOR), 0.0, 1.0)     # linear fraction of full-scale
             x = right_start + frac * linear_width             # map fraction → horizontal position
             pts.append((x, y))                 # append point
@@ -740,9 +802,9 @@ while running:
     # =========================
     # HEADER TEXT
     # =========================
-    font = pygame.font.SysFont(None, 30)       # medium font for key header text
-    inst_font = pygame.font.SysFont(None, 20)  # smaller font for instrument/status lines
-    title_font = pygame.font.SysFont(None, 22) # small title font for plot labels
+    font = pygame.font.SysFont(None, 24)       # medium font for key header text
+    inst_font = pygame.font.SysFont(None, 16)  # smaller font for instrument/status lines
+    title_font = pygame.font.SysFont(None, 18) # small title font for plot labels
 
     header_y0 = GRAPH_TOP + 10                 # header baseline y position
 
@@ -803,19 +865,6 @@ while running:
         pygame.draw.rect(screen, handle_color, (LEVER_X - 14, lever_y, 28, LEVER_HEIGHT)) # lever handle
         nm = font.render(lever_name, True, BLACK) # lever name label
         screen.blit(nm, nm.get_rect(center=(LEVER_X, LEVER_TRACK_BOTTOM + 34))) # place under lever
-
-        scale_x = LEVER_X + 220                   # x location for reactivity scale
-        pygame.draw.line(screen, BLACK, (scale_x, LEVER_TRACK_TOP), (scale_x, LEVER_TRACK_BOTTOM), 3) # scale line
-        plus_lbl = font.render("+", True, BLACK)   # plus label
-        minus_lbl = font.render("-", True, BLACK)  # minus label
-        screen.blit(plus_lbl, plus_lbl.get_rect(center=(scale_x + 26, LEVER_TRACK_TOP - 16)))         # place plus near top
-        screen.blit(minus_lbl, minus_lbl.get_rect(center=(scale_x + 26, LEVER_TRACK_BOTTOM + 16)))    # place minus near bottom
-
-        rho_span = (RHO_POS_LIMIT - RHO_NEG_LIMIT) # total span of scale
-        rho_frac = (rho_now - RHO_NEG_LIMIT) / max(1e-9, rho_span)  # normalize rho into [0,1] across bounds
-        rho_frac = clamp(rho_frac, 0.0, 1.0)       # clamp within scale
-        pointer_y = LEVER_TRACK_BOTTOM - rho_frac * (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP) # map fraction to y position
-        pygame.draw.circle(screen, BLACK, (scale_x, int(pointer_y)), 6) # draw indicator dot
 
         for i in range(NUM_DIALS):                 # draw each dial
             cx, cy = dial_centers[i]               # dial center
