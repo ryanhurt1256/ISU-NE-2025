@@ -1,21 +1,22 @@
-# AGN-201 Simulation5.1.py
+# AGN-201 Simulation7.0.py
 #
 # PURPOSE
 # -------
-# A “panel-realistic” reactor simulator display:
+# A panel-realistic reactor simulator display:
 #   • Runs 1-group point kinetics with 1 delayed-neutron precursor group.
 #   • Maps a single Fine Control Rod (FCR) position → reactivity ρ(t).
 #   • Computes neutron state n(t), precursor C(t), then maps n → power (W).
 #   • Synthesizes two instrument channels (CH2 log, CH3 linear) from power.
-#   • Allows on-screen controls now, but supports future physical controls via serial.
+#   • Allows on-screen controls, and supports physical controls via serial.
 #   • Provides SCRAM behaviors (manual, external, power switch) and auto-SCRAM on 0 W / 10 W.
 #
 # NOTE ON MODELING CHOICES
 # ------------------------
 # This is a simplified dynamics model:
 #   • One delayed group (instead of 6). Good for “feel” and stability, not for licensing work.
-#   • Uses RK4 integration with sub-stepping for stability at small Λ.
-#   • Uses first-order lag on reactivity to mimic actuator/instrument smoothing and reduce jitter.
+#   • Uses an instantaneous prompt-jump correction when reactivity changes.
+#   • Uses RK4 integration with sub-stepping for delayed evolution stability at small Λ.
+#   • Instrument channels use first-order lag for display smoothing.
 #
 # SIGN CONVENTION (IMPORTANT)
 # ---------------------------
@@ -26,13 +27,13 @@
 # FCR MAPPING
 # -----------
 # Rod withdrawn (down) → more negative ρ
-# Rod inserted (up)  → less negative / more positive ρ
+# Rod inserted (up)  → more positive ρ
 #
-# SERIAL INPUT FORMAT (optional)
+# SERIAL INPUT FORMAT
 # ------------------------------
 # Expects CSV lines:
 #   rod_frac,ch2_det,ch3_det,power_sw,scram_sw\n
-#     rod_frac: float 0..1  (0 inserted, 1 withdrawn)
+#     rod_frac: float 0..1  (0 withdrawn, 1 inserted)
 #     ch2_det : int -3..+3  (dial detent)
 #     ch3_det : int -3..+3  (dial detent)
 #     power_sw: 0/1         (power switch)
@@ -54,28 +55,30 @@ except Exception:
     serial = None                 # if pyserial not installed, disable serial I/O cleanly
 
 # =========================
-# PHYSICS CONFIG (TUNE THESE)
+# PHYSICS CONFIG (TUNED 3/14/2026)
 # =========================
-beta   = 0.0065                   # β: effective delayed neutron fraction (dimensionless)
-Lambda = 5e-5                     # Λ: prompt neutron generation time (s)  (small → stiff equations)
-lam    = 0.08                     # λ: precursor decay constant (1/s) for the single delayed group
+beta   = 0.00745                  # βeff: effective delayed neutron fraction from AGN-201 appendix (dimensionless)
+Lambda = 6.22e-5                  # Λ: neutron generation lifetime from AGN-201 appendix (s)
 
-S_SOURCE = 1e-6                   # S: small external source term (neutron population “floor”)
+lam    = 0.3744                   # λeff: 1-group delayed neutron decay constant (1/s), obtained by averaging 6-group data to one group using the β-weighted average λeff = Σ(βi*λi)/Σβi
 
-# Fully inserted is negative; withdrawing adds + worth
-RHO_INSERTED  = -0.0040           # ρ at fully inserted rod position (subcritical baseline)
-RHO_WORTH_MAG = +0.0100           # total positive worth available from fully withdrawing rod
+# Prompt jump model
+PROMPT_JUMP_ENABLE = True         # apply 1-group prompt-jump correction when applied reactivity changes
+PROMPT_JUMP_EPS    = 1e-8         # minimum |Δρ| required before applying prompt jump (prevents tiny numerical chatter)
+
+# Fully withdrawn is negative; inserting adds + worth
+RHO_WITHDRAWN   = -7.44e-4        # ρ at fully withdrawn rod position (subcritical baseline), chosen so that ~10 cm inserted is near critical, consistent with lab procedure
+RHO_WORTH_MAG   = +3.10e-3        # total positive worth of the fuel-loaded FCR, 0.00310 Δk/k
 
 # Hard safety bounds
 RHO_NEG_LIMIT = -0.20             # clamp lower bound to avoid runaway negative stiffness / nonsense
 RHO_POS_LIMIT = 0.90 * beta       # clamp upper bound below β to avoid prompt-supercritical blowup
 
 # Reactivity smoothing
-RHO_TAU      = 0.20               # time constant (s) for lag filter on commanded ρ → applied ρ
+RHO_TAU      = 0.00               # time constant (s) for lag filter on commanded ρ → applied ρ
 RHO_DEADBAND = 2e-5               # small deadband to prevent chatter when changes are tiny
 
-# Power mapping (n -> W)
-P_SCALE = 3.0                     # scalar mapping neutron state n → displayed watts (W = P_SCALE*n)
+# Power mapping
 MAX_POWER_DISPLAY = 5.0           # plot-only cap for graph readability (does NOT limit physics)
 
 # =========================
@@ -112,22 +115,30 @@ CH3_RANGES = [                    # CH3 full-scale current ranges (A), detent -3
 # =========================
 FCR_TRAVEL_CM = 23.0              # physical rod travel (cm) used to convert fraction ↔ cm
 
-FCR_CURVE_POINTS_CM_PCT = [       # (cm_inserted, %total_worth_inserted) points approximated from AGN data
+FCR_CURVE_POINTS_CM_PCT = [       # (cm_inserted, %total_worth_inserted) points from FCR worth curve
     (0.0,   0.0),
-    (2.0,   1.0),
-    (5.0,   5.0),
-    (8.0,  12.0),
-    (10.0, 20.0),
-    (12.0, 30.0),
-    (13.0, 37.0),
-    (14.0, 45.0),
-    (15.0, 55.0),
+    (1.0,   0.5),
+    (2.0,   1.5),
+    (3.0,   2.7),
+    (4.0,   4.0),
+    (5.0,   5.5),
+    (6.0,   8.0),
+    (7.0,  11.0),
+    (8.0,  15.0),
+    (9.0,  19.0),
+    (10.0, 24.0),
+    (11.0, 30.0),
+    (12.0, 36.0),
+    (13.0, 43.0),
+    (14.0, 50.0),
+    (15.0, 57.0),
     (16.0, 65.0),
-    (17.0, 75.0),
-    (18.0, 85.0),
-    (19.0, 93.0),
-    (20.0, 97.0),
+    (17.0, 72.0),
+    (18.0, 80.0),
+    (19.0, 87.0),
+    (20.0, 94.0),
     (21.0, 99.0),
+    (22.0, 100.0),
     (23.0, 100.0),
 ]
 
@@ -138,7 +149,7 @@ pygame.init()                     # initialize all Pygame subsystems (display, f
 
 #WIDTH, HEIGHT = 1700, 1200        # window pixel size
 #screen = pygame.display.set_mode((WIDTH, HEIGHT))  # create window surface
-screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN) # Use native display resolution (important for Raspberry Pi deployment)
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN) # Use native display resolution (important for Raspberry Pi)
 WIDTH, HEIGHT = screen.get_size() # window pixel size of display being used
 pygame.display.set_caption("Control Panel (FCR) — CH2 LOG + CH3 LIN")  # window title
 clock = pygame.time.Clock()       # FPS timing controller (used with clock.tick)
@@ -153,6 +164,14 @@ GREEN  = (0, 200, 0)
 SCRAM_RED = (255, 0, 0)
 DIAL_INACTIVE_COLOR  = (50, 50, 50)    # dial face color when idle
 LEVER_INACTIVE_COLOR = (80, 80, 80)    # lever handle color when inactive / disabled
+
+# ---------- FONT CACHE ----------
+# Create fonts once at startup
+font = pygame.font.SysFont(None, 24)       # medium font for key header text
+inst_font = pygame.font.SysFont(None, 16)  # smaller font for instrument/status lines
+title_font = pygame.font.SysFont(None, 18) # small title font for plot labels
+tab_font = pygame.font.SysFont(None, 22)   # font for collapse/expand tab
+dial_tick_font = pygame.font.SysFont(None, 18)  # small font for dial tick labels
 
 # ---------- BASE LAYOUT ----------
 MARGIN_LEFT, MARGIN_RIGHT, MARGIN_BOTTOM = 30, 30, 20  # margins; bottom mostly reserved for toggle tab
@@ -170,12 +189,12 @@ TOGGLE_GAP = 8                  # gap between graph region and the toggle tab
 # Controls collapse state
 controls_collapsed = False      # False = controls visible; True = controls hidden and graphs expand
 
-# Dynamic layout vars (initialized via update_layout)
+# Dynamic layout vars
 GRAPH_HEIGHT = BASE_GRAPH_HEIGHT  # actual current graph height (changes if collapsed)
 linear_width = GRAPH_WIDTH // 2   # each plot gets half the width
 right_start  = GRAPH_X + linear_width  # x origin for the right-hand plot
 
-# Lever geometry (one lever)
+# Lever geometry
 LEVER_TRACK_TOP    = 0           # y (px) of lever track top; computed in update_layout
 LEVER_TRACK_BOTTOM = 0           # y (px) of lever track bottom; computed in update_layout
 LEVER_HEIGHT       = 70          # lever handle height (px)
@@ -197,7 +216,7 @@ power_on = False                        # system “powered” state; gates phys
 POWER_RECT = pygame.Rect(0, 0, button_width, button_height)  # placeholder; real position set in update_layout()
 SCRAM_RECT = pygame.Rect(70, 0, 90, 90)  # SCRAM button rectangle; y fixed in update_layout
 
-# Toggle tab rect (updated in layout)
+# Toggle tab rect
 TOGGLE_RECT = pygame.Rect(GRAPH_X, GRAPH_Y + GRAPH_HEIGHT + TOGGLE_GAP, GRAPH_WIDTH, TOGGLE_H)  # placeholder, updated later
 
 # Selection + cooldown
@@ -218,12 +237,12 @@ ch2_history = collections.deque(maxlen=300)   # CH2 time history buffer (most re
 ch3_history = collections.deque(maxlen=300)   # CH3 time history buffer
 power_history = collections.deque(maxlen=300) # power time history buffer (currently not drawn, but retained)
 
-# Indicated currents (instrument readouts)
+# Indicated currents
 ch2_I_ind = I_FLOOR               # current displayed by CH2 after lag filtering
 ch3_I_ind = I_FLOOR               # current displayed by CH3 after lag filtering
 
 # Kinetics state
-n = 1e-12                         # neutron “state” (arbitrary units); analogous to neutron population / flux amplitude
+n = 1e-12                         # neutron/power state amplitude; here displayed power is taken directly from n
 C = 0.0                           # delayed neutron precursor concentration (arbitrary units)
 rho_prev = 0.0                    # previous applied reactivity (for filtering and continuity)
 rho_now  = 0.0                    # current applied reactivity used in kinetics RHS
@@ -232,7 +251,7 @@ rho_now  = 0.0                    # current applied reactivity used in kinetics 
 sim_time_s = 0.0                  # simulation time accumulator (only increments when power_on and not scram)
 power_on_wall_time = 0.0          # wall-clock timestamp when power was turned on (informational / future use)
 
-# Auto-scram debounce timers (NEW)
+# Auto-scram debounce timers
 high_scram_timer = 0.0            # accumulates time spent above SCRAM_HIGH_W
 low_scram_timer  = 0.0            # accumulates time spent below SCRAM_LOW_W
 
@@ -251,7 +270,7 @@ def setup_serial():
         return None
     for p in SERIAL_PORTS:        # try each possible port in order
         try:
-            s = serial.Serial(p, BAUDRATE, timeout=0.05)  # open port with short timeout (non-blocking-ish)
+            s = serial.Serial(p, BAUDRATE, timeout=0)  # open port in non-blocking mode to avoid frame stalls
             time.sleep(1.0)       # give Arduino time to reset after opening port
             return s              # return open serial object on success
         except Exception:
@@ -259,20 +278,21 @@ def setup_serial():
     return None                   # no port found
 
 ser = setup_serial()              # attempt to open serial once at startup
+
 # =========================
 # BLUETOOTH SEND (Pi #1 -> Pi #2)
 # =========================
 # Streams simulation time and neutron state to a second Raspberry Pi via Bluetooth RFCOMM.
 
 BT_ADDR = "AA:BB:CC:DD:EE:FF"   # Bluetooth MAC address of the receiving Raspberry Pi NEEDS TO BE ADJUSTED FOR BLUETOOTH DEVICE
-BT_CH = 1                       # RFCOMM channel number (must match receiver) NEEDS TO BE ADJUSTED
+BT_CH = 1                       # RFCOMM channel number (must match receiver)
 BT_HZ = 20                      # Data transmission rate (messages per second)
 
 bt_sock = None                  # Bluetooth socket object (None until connection established)
 bt_last_send = 0.0              # Timestamp of last transmitted message
 bt_next_retry = 0.0             # next time to attempt a Bluetooth connect
 BT_RETRY_S = 1.5                # wait this long between connection attempts (prevents frame-freeze spam)
-BT_STARTUP_DELAY_S = 1.0         # wait this long after program start before first BT connect attempt
+BT_STARTUP_DELAY_S = 1.0        # wait this long after program start before first BT connect attempt
 bt_enable_time = time.time() + BT_STARTUP_DELAY_S  # earliest wall-time when BT is allowed to connect
 
 def bt_connect():
@@ -282,22 +302,24 @@ def bt_connect():
         socket.SOCK_STREAM,              # Stream socket (serial-like)
         socket.BTPROTO_RFCOMM            # RFCOMM protocol
     )
-    s.settimeout(0.35)                   # IMPORTANT: prevents connect() from freezing the UI loop
+    s.settimeout(0.10)                   # shorter timeout further reduces visible connect hitches in the GUI loop
     s.connect((BT_ADDR, BT_CH))          # Connect to receiver Pi (can raise timeout/OS errors)
-    s.settimeout(0.20)                   # Return socket to blocking mode for send()
+    s.settimeout(0.0)                    # set non-blocking mode for send() so Bluetooth cannot stall the frame loop
     return s                             # Return connected socket
 
 def read_controls_from_serial(ser_obj):
     if ser_obj is None:           # if no serial object, no data
         return None
     try:
+        if hasattr(ser_obj, "in_waiting") and ser_obj.in_waiting <= 0:  # avoid readline() when no bytes are waiting
+            return None
         raw = ser_obj.readline().decode(errors="ignore").strip()  # read one line, decode bytes, strip whitespace
         if not raw:               # empty line means no fresh data
             return None
         parts = raw.split(",")    # split CSV fields
         if len(parts) < 5:        # must have 5 fields
             return None
-        rod_frac = float(parts[0])           # rod position fraction (0..1)
+        rod_frac = float(parts[0])           # rod position fraction (0..1), 0 withdrawn and 1 inserted
         ch2_det  = int(float(parts[1]))      # CH2 dial detent (ensure tolerant parse)
         ch3_det  = int(float(parts[2]))      # CH3 dial detent
         power_sw = bool(int(float(parts[3])))# power switch state (0/1)
@@ -332,21 +354,20 @@ def format_watts(P):
 
 def kinetics_rhs(n_s, C_s, rho):
     # POINT KINETICS (1 delayed group)
-    # dn/dt = ((ρ - β)/Λ) n + λ C + S
+    # dn/dt = ((ρ - β)/Λ) n + λ C
     # dC/dt = (β/Λ) n - λ C
     #
     # Interpretation:
-    #   • n is the amplitude of neutron population / flux.
+    #   • n is the amplitude of neutron population / flux / power.
     #   • C is precursor concentration producing delayed neutrons at rate λC.
     #   • ρ introduces net multiplication: ρ>0 increases dn/dt, ρ<0 decreases dn/dt.
     #   • β/Λ term moves some production into precursor inventory.
-    #   • S provides a background source so n never collapses to exactly zero.
-    dn = ((rho - beta) / Lambda) * n_s + lam * C_s + S_SOURCE  # neutron balance ODE
-    dC = (beta / Lambda) * n_s - lam * C_s                     # precursor balance ODE
-    return dn, dC                                              # return derivatives for integrator
+    dn = ((rho - beta) / Lambda) * n_s + lam * C_s  # neutron balance ODE
+    dC = (beta / Lambda) * n_s - lam * C_s          # precursor balance ODE
+    return dn, dC                                   # return derivatives for integrator
 
 def rk4_step(n0, C0, dt, rho):
-    # 4th-order Runge-Kutta (RK4) integration for stiff-ish kinetics (Λ small).
+    # 4th-order Runge-Kutta (RK4) integration for stiff kinetics (Λ small).
     # RK4 reduces numerical error compared to Euler and is stable for small dt.
     k1n, k1C = kinetics_rhs(n0, C0, rho)                                        # slope at start
     k2n, k2C = kinetics_rhs(n0 + 0.5*dt*k1n, C0 + 0.5*dt*k1C, rho)             # slope at midpoint (1)
@@ -356,8 +377,27 @@ def rk4_step(n0, C0, dt, rho):
     C1 = C0 + (dt/6.0)*(k1C + 2*k2C + 2*k3C + k4C)                             # weighted average update
     return n1, C1                                                               # next state
 
-def smooth_points(points, steps=6):
-    # Simple linear interpolation densification used to make CH3 line look smoother
+def apply_prompt_jump(n_old, rho_old, rho_new):
+    # 1-group prompt-jump approximation:
+    #   n+ / n- = (β - ρ_old) / (β - ρ_new)
+    #
+    # Assumptions:
+    #   • precursor concentration C does not change instantaneously
+    #   • reactivity change is effectively instantaneous to the neutron population
+    #   • valid only while ρ remains below prompt critical (ρ < β)
+    denom = beta - rho_new                        # denominator of prompt-jump ratio
+    if denom <= 1e-12:                            # extra safety guard against divide-by-zero / nonsense
+        return n_old                              # if somehow invalid, leave neutron state unchanged
+
+    numer = beta - rho_old                        # numerator of prompt-jump ratio
+    if numer <= 1e-12:                            # extra guard against invalid old state near/above prompt critical
+        return n_old
+
+    ratio = numer / denom                         # prompt-jump multiplier from old to new reactivity
+    ratio = clamp(ratio, 0.1, 10.0)              # keep single-frame jump bounded against numerical spikes
+    return max(1e-12, n_old * ratio)             # apply jump and keep neutron state above numerical floor
+
+def smooth_points(points, steps=6): # Simple linear interpolation densification used to make CH3 line look smoother
     if len(points) < 2:             # not enough points to smooth
         return points
     out = []                        # output list of densified points
@@ -374,7 +414,6 @@ def angle_from_detent(det):
     return -90.0 + 30.0 * float(clamp(det, -3, 3))  # detent -3..3 maps to pointer angle degrees
 
 def draw_dial_ticks(cx, cy, radius):
-    font = pygame.font.SysFont(None, 18)            # small font for dial tick labels
     angle_step = 30                                 # degrees between detents
     for i in range(7):                              # 7 detents: -3,-2,-1,0,+1,+2,+3
         det = i - 3                                 # convert loop index to detent value
@@ -391,17 +430,17 @@ def draw_dial_ticks(cx, cy, radius):
         lx = cx + (radius + 22) * math.cos(ang)     # label position x (outside dial)
         ly = cy + (radius + 22) * math.sin(ang)     # label position y
         label_txt = "0" if det == 0 else str(det)   # print 0 at center, otherwise detent number
-        lab = font.render(label_txt, True, BLACK)   # rasterize label text surface
+        lab = dial_tick_font.render(label_txt, True, BLACK)   # rasterize label text surface
         screen.blit(lab, lab.get_rect(center=(lx, ly)))  # blit centered at label position
 
-def lever_withdrawn_fraction(y):
+def lever_inserted_fraction(y):
     travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)  # total usable travel (px)
     if travel <= 0:                        # safety: avoid divide-by-zero if layout invalid
         return 0.0
-    x = (LEVER_TRACK_BOTTOM - LEVER_HEIGHT - y) / travel  # map y to fraction (top=1, bottom=0)
+    x = (LEVER_TRACK_BOTTOM - LEVER_HEIGHT - y) / travel  # map y to fraction (top=1 inserted, bottom=0 withdrawn)
     return clamp(x, 0.0, 1.0)            # clamp to 0..1 physical fraction
 
-def lever_y_from_withdrawn(x):
+def lever_y_from_inserted(x):
     travel = (LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP - LEVER_HEIGHT)  # total usable travel (px)
     return (LEVER_TRACK_BOTTOM - LEVER_HEIGHT) - clamp(x, 0.0, 1.0) * travel  # fraction → y position
 
@@ -420,25 +459,18 @@ def interp_piecewise(points, x):
             return y0 + t * (y1 - y0)      # linear interpolate y
     return points[-1][1]                   # fallback (should not hit)
 
-def fcr_withdrawn_worth_fraction(x_withdrawn):
-    # Convert withdrawn fraction x_withdrawn ∈ [0,1] to “fraction of total worth withdrawn”.
-    # plot is “% total worth vs cm inserted”, i.e. g(inserted_cm).
-    # compute inserted_cm from withdrawn fraction, then:
-    #   g_inserted = pct_inserted/100
-    #   f_withdrawn = 1 - g_inserted
-    x_withdrawn = clamp(float(x_withdrawn), 0.0, 1.0)        # enforce numeric and clamp
-    cm_inserted = (1.0 - x_withdrawn) * FCR_TRAVEL_CM        # 1→0 cm inserted, 0→full cm inserted
-    pct = interp_piecewise(FCR_CURVE_POINTS_CM_PCT, cm_inserted) # interpolate % inserted-worth from table
-    g_inserted = clamp(pct / 100.0, 0.0, 1.0)                # convert to fraction 0..1
-    f_withdrawn = 1.0 - g_inserted                           # remaining worth is withdrawn
-    return clamp(f_withdrawn, 0.0, 1.0)                      # final clamp
+def fcr_inserted_worth_fraction(x_inserted):                # Convert inserted fraction x_inserted ∈ [0,1] to “fraction of total worth inserted”.  Table is “% total worth vs cm inserted”.
+    x_inserted = clamp(float(x_inserted), 0.0, 1.0)         # enforce numeric and clamp
+    cm_inserted = x_inserted * FCR_TRAVEL_CM                # convert inserted fraction to inserted depth (cm)
+    pct = interp_piecewise(FCR_CURVE_POINTS_CM_PCT, cm_inserted)  # interpolate % inserted-worth from table
+    f_inserted = clamp(pct / 100.0, 0.0, 1.0)               # convert to fraction 0..1
+    return f_inserted                                       # final fraction of total worth inserted
 
-def reset_on_power_on(now):
-    # Reset state variables when transitioning from OFF → ON (fresh run condition).
+def reset_on_power_on(now): # Reset state variables when transitioning from OFF → ON (fresh run condition).
     global n, C, rho_prev, rho_now
     global ch2_I_ind, ch3_I_ind
     global sim_time_s, power_on_wall_time
-    global high_scram_timer, low_scram_timer  # NEW
+    global high_scram_timer, low_scram_timer  
 
     power_history.clear()          # clear stored power trace
     ch2_history.clear()            # clear CH2 trace
@@ -447,7 +479,7 @@ def reset_on_power_on(now):
     sim_time_s = 0.0               # reset simulation time counter
     power_on_wall_time = now       # remember wall time when power was enabled
 
-    n = max(1e-12, 1.0 / P_SCALE)  # initialize n so that P≈1W (since P = P_SCALE*n)
+    n = 1.0                        # initialize state so displayed power starts at about 1 W (here power = n)
     C = (beta / (Lambda * lam)) * n# set C near the steady-state relation for 1-group kinetics at ρ≈0
     rho_prev = 0.0                 # reset applied reactivity
     rho_now = 0.0                  # reset applied reactivity
@@ -460,7 +492,6 @@ def reset_on_power_on(now):
     low_scram_timer  = 0.0         # reset low-power debounce timer
 
 def start_scram(reason, now):
-    """Common SCRAM entry point + debounce timer reset."""
     global scram_active, scram_start_time, scram_reason
     global high_scram_timer, low_scram_timer
     if not scram_active:           # only start SCRAM once per event
@@ -472,7 +503,7 @@ def start_scram(reason, now):
 
 def update_layout(collapsed):
     """
-    Layout policy:
+    Layout:
       • Graph height grows when controls are collapsed (controls hidden).
       • When expanded, graph returns to BASE_GRAPH_HEIGHT.
       • Control positions stay tied to graph bottom so everything shifts consistently.
@@ -481,7 +512,7 @@ def update_layout(collapsed):
     global LEVER_TRACK_TOP, LEVER_TRACK_BOTTOM, lever_y
     global SCRAM_RECT, POWER_RECT, dial_centers, TOGGLE_RECT
 
-    xw = lever_withdrawn_fraction(lever_y) if LEVER_TRACK_TOP != 0 else 0.0  # preserve lever fraction during relayout
+    xins = lever_inserted_fraction(lever_y) if LEVER_TRACK_TOP != 0 else 0.0  # preserve lever inserted fraction during relayout
 
     if collapsed:
         bottom_reserve = TOGGLE_GAP + TOGGLE_H + 12   # reserve pixels for tab + small padding
@@ -499,7 +530,7 @@ def update_layout(collapsed):
 
     LEVER_TRACK_TOP    = GRAPH_Y + GRAPH_HEIGHT + 50  # lever track starts below graph region
     LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 200        # lever track length fixed
-    lever_y = lever_y_from_withdrawn(xw)              # restore lever y for preserved withdrawn fraction
+    lever_y = lever_y_from_inserted(xins)             # restore lever y for preserved inserted fraction
 
     SCRAM_RECT = pygame.Rect(70, LEVER_TRACK_TOP + 40, 90, 90)  # SCRAM button follows lever location
 
@@ -511,11 +542,10 @@ def update_layout(collapsed):
         for i in range(NUM_DIALS)
     ]
 
-# initialize layout once
-lever_y = GRAPH_Y + BASE_GRAPH_HEIGHT                 # temporary y so lever_withdrawn_fraction won't divide by zero
+lever_y = GRAPH_Y + BASE_GRAPH_HEIGHT                 # temporary y so lever_inserted_fraction won't divide by zero
 LEVER_TRACK_TOP = GRAPH_Y + BASE_GRAPH_HEIGHT + 95    # set initial lever track top
 LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 270            # set initial lever track bottom
-lever_y = LEVER_TRACK_BOTTOM - LEVER_HEIGHT           # start lever fully inserted (down)
+lever_y = LEVER_TRACK_BOTTOM - LEVER_HEIGHT           # start lever fully withdrawn (down)
 update_layout(controls_collapsed)                     # compute final positions from layout state
 
 # =========================
@@ -533,11 +563,11 @@ while running:
         dt = 0.1
     last_time = now                                   # update last_time for next frame
 
-    # ---------- SERIAL INPUT (optional) ----------
+    # ---------- SERIAL INPUT ----------
     sc = read_controls_from_serial(ser)               # attempt to read one serial control line
     if sc is not None:                                # if valid data received
         rod_frac, ch2_det, ch3_det, power_sw, scram_sw = sc  # unpack controls
-        lever_y = lever_y_from_withdrawn(rod_frac)    # set lever position from rod fraction
+        lever_y = lever_y_from_inserted(rod_frac)     # set lever position from inserted fraction
         dial_detents[0] = ch2_det                     # set CH2 dial detent
         dial_detents[1] = ch3_det                     # set CH3 dial detent
 
@@ -618,10 +648,10 @@ while running:
     if (not controls_collapsed) and power_on and not scram_active:  # only allow keyboard control when visible & running
         if selected_lever and lever_active:           # if lever is selected and active
             speed = 260.0                             # lever speed (px/s) when holding arrow key
-            if keys[pygame.K_UP]:                     # up arrow withdraws rod (move handle up)
+            if keys[pygame.K_UP]:                     # up arrow inserts rod (move handle up)
                 lever_y -= speed * dt                 # update lever y by speed*dt
                 lever_activation_time = now           # refresh activity timer
-            elif keys[pygame.K_DOWN]:                 # down arrow inserts rod (move handle down)
+            elif keys[pygame.K_DOWN]:                 # down arrow withdraws rod (move handle down)
                 lever_y += speed * dt
                 lever_activation_time = now
             lever_y = clamp(lever_y, LEVER_TRACK_TOP, LEVER_TRACK_BOTTOM - LEVER_HEIGHT)  # keep within track
@@ -646,7 +676,7 @@ while running:
 
     # ---------- SCRAM BEHAVIOR ----------
     if scram_active:                             # if currently scramming
-        lever_y = LEVER_TRACK_BOTTOM - LEVER_HEIGHT  # force lever fully inserted visually
+        lever_y = LEVER_TRACK_TOP                # force lever fully inserted visually
         if (now - scram_start_time) > 3.0:       # after scram hold duration
             power_on = False                     # shut system power off
             scram_active = False                 # exit scram state
@@ -670,7 +700,7 @@ while running:
             high_scram_timer = 0.0               # reset debounce timers
             low_scram_timer  = 0.0
 
-            lever_y = LEVER_TRACK_BOTTOM - LEVER_HEIGHT  # keep lever inserted
+            lever_y = LEVER_TRACK_TOP            # keep lever inserted
             dial_detents[:] = [0, 0]             # reset dials to center detent
             lever_active = False                 # drop selections
             dial_active[:] = [False, False]
@@ -682,30 +712,34 @@ while running:
     if power_on and not scram_active:            # only update physics when system is on and not in scram
         sim_time_s += dt                         # advance simulation time
 
-        x_withdrawn = lever_withdrawn_fraction(lever_y)        # convert lever y → withdrawn fraction 0..1
-        f_withdrawn = fcr_withdrawn_worth_fraction(x_withdrawn)# curve mapping: fraction of worth withdrawn
+        x_inserted = lever_inserted_fraction(lever_y)        # convert lever y → inserted fraction 0..1
+        f_inserted = fcr_inserted_worth_fraction(x_inserted) # curve mapping: fraction of worth inserted
 
-        rho_cmd = RHO_INSERTED + RHO_WORTH_MAG * f_withdrawn   # commanded reactivity from rod worth curve
+        rho_cmd = RHO_WITHDRAWN + RHO_WORTH_MAG * f_inserted # commanded reactivity from rod worth curve
         rho_cmd = clamp(rho_cmd, RHO_NEG_LIMIT, RHO_POS_LIMIT) # enforce safety bounds
 
-        if abs(rho_cmd - rho_prev) < RHO_DEADBAND:             # deadband to prevent chatter
+        if abs(rho_cmd - rho_prev) < RHO_DEADBAND:           # deadband to prevent chatter
             rho_cmd = rho_prev
+
+        rho_old = rho_prev                                   # store previous applied reactivity for prompt-jump logic
         rho_now = first_order_lag(rho_prev, rho_cmd, dt, RHO_TAU)  # apply lag filter to reactivity
 
+        if PROMPT_JUMP_ENABLE and abs(rho_now - rho_old) > PROMPT_JUMP_EPS:  # apply prompt jump only for meaningful Δρ
+            n = apply_prompt_jump(n, rho_old, rho_now)       # instantaneous neutron-population jump; C does not jump
+
         substeps = 12                           # subdivide dt to keep RK4 stable for small Λ
-        h = dt / substeps                      # substep size
+        h = dt / substeps                       # substep size
         for _ in range(substeps):              # integrate across dt using many small steps
-            n, C = rk4_step(n, C, h, rho_now)  # advance kinetics states
+            n, C = rk4_step(n, C, h, rho_now)  # advance kinetics states after the prompt jump
             if (not (n == n)) or n < 1e-12:    # guard NaN and negative state
                 n = 1e-12
             if (not (C == C)) or C < 0.0:      # guard NaN and negative precursor
                 C = 0.0
 
         rho_prev = rho_now                     # store applied ρ for next frame
+        power_raw = max(0.0, n)               # displayed power is taken directly from kinetics amplitude
 
-        power_raw = max(0.0, P_SCALE * n)      # compute “raw power” from neutron state
-
-        # ---------- AUTO-SCRAM LOGIC (NEW) ----------
+        # ---------- AUTO-SCRAM LOGIC ----------
         if power_raw >= SCRAM_HIGH_W:          # if above high threshold
             high_scram_timer += dt             # accumulate time above threshold
         else:
@@ -738,7 +772,7 @@ while running:
         ch3_I_ind = first_order_lag(ch3_I_ind, I_FLOOR, dt, 0.5)
 
     # ---------- BLUETOOTH DATA STREAM ----------
-    # Sends current simulation time and neutron state to the second Pi without ever stalling the GUI
+    # Sends current simulation time and neutron state and power to the second Pi without ever stalling the GUI
     # Try to connect only occasionally (NOT every frame), and never block the loop for long
     if bt_sock is None:
         if now >= bt_enable_time and now >= bt_next_retry: # only attempt connection at a controlled rate
@@ -754,6 +788,8 @@ while running:
             try:
                 line = f"{sim_time_s:.4f},{n:.6e}\n"      # Format: sim_time_s, n
                 bt_sock.send(line.encode("utf-8"))        # transmit
+            except (BlockingIOError, InterruptedError):
+                pass                                      # skip this frame if non-blocking Bluetooth send would stall
             except Exception:
                 try:
                     bt_sock.close()                       # close broken socket
@@ -797,15 +833,11 @@ while running:
             frac = clamp(I / max(fs3, I_FLOOR), 0.0, 1.0)     # linear fraction of full-scale
             x = right_start + frac * linear_width             # map fraction → horizontal position
             pts.append((x, y))                 # append point
-        pygame.draw.lines(screen, RED, False, smooth_points(pts, steps=6), 2)  # draw smoothed linear trace
+        pygame.draw.lines(screen, RED, False, smooth_points(pts, steps=4), 2)  # draw smoothed linear trace with lighter densification for less per-frame work
 
     # =========================
     # HEADER TEXT
     # =========================
-    font = pygame.font.SysFont(None, 24)       # medium font for key header text
-    inst_font = pygame.font.SysFont(None, 16)  # smaller font for instrument/status lines
-    title_font = pygame.font.SysFont(None, 18) # small title font for plot labels
-
     header_y0 = GRAPH_TOP + 10                 # header baseline y position
 
     n_line = inst_font.render(                 # render neutron state and sim time
@@ -843,7 +875,6 @@ while running:
     # =========================
     pygame.draw.rect(screen, (220, 220, 220), TOGGLE_RECT)  # draw tab background
     pygame.draw.rect(screen, BLACK, TOGGLE_RECT, 2)         # draw tab border
-    tab_font = pygame.font.SysFont(None, 22)                # font for tab text
     tab_txt = "▼ Show Controls" if controls_collapsed else "▲ Hide Controls"  # tab label depends on state
     tab = tab_font.render(tab_txt, True, BLACK)             # render tab label
     screen.blit(tab, tab.get_rect(center=TOGGLE_RECT.center)) # center label in tab
@@ -885,7 +916,7 @@ while running:
             screen.blit(det_txt, det_txt.get_rect(center=(cx, cy + DIAL_RADIUS + 20))) # place below dial
 
     pygame.display.flip()           # present the composed frame to the screen
-    clock.tick(60)                 # cap loop to ~60 frames per second (also stabilizes dt)
+    clock.tick(60)                  # cap loop to ~60 frames per second (also stabilizes dt)
 
 pygame.quit()                      # shut down Pygame cleanly
 sys.exit()                         # exit program
