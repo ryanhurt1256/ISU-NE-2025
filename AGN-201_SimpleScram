@@ -1,4 +1,4 @@
-# AGN-201 Simulation7.0.py
+# AGN-201 Simulation7.1.py
 #
 # PURPOSE
 # -------
@@ -182,7 +182,7 @@ GRAPH_X    = MARGIN_LEFT        # left edge of plot region
 GRAPH_Y    = GRAPH_TOP + HEADER_H   # top of plot region (below header)
 GRAPH_WIDTH  = WIDTH - MARGIN_LEFT - MARGIN_RIGHT  # usable horizontal plot width
 
-BASE_GRAPH_HEIGHT = int(HEIGHT * 0.45)  # default plot height when controls are visible
+BASE_GRAPH_HEIGHT = int(HEIGHT * 0.34)  # default plot height when controls are visible
 TOGGLE_H = 30                   # height of collapse/expand “Controls” tab
 TOGGLE_GAP = 8                  # gap between graph region and the toggle tab
 
@@ -210,7 +210,7 @@ dial_names  = ["CH2 Range (LOG)", "CH3 Range (LIN)"]  # labels
 dial_detents = [0, 0]            # dial detents (integers -3..+3), applied to CH2 and CH3
 
 # Buttons
-button_width, button_height = 120, 55   # size for POWER button
+button_width, button_height = 100, 50   # size for POWER button
 power_on = False                        # system “powered” state; gates physics updates
 #POWER_RECT = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  # POWER button rectangle
 POWER_RECT = pygame.Rect(0, 0, button_width, button_height)  # placeholder; real position set in update_layout()
@@ -503,45 +503,66 @@ def start_scram(reason, now):
 
 def update_layout(collapsed):
     """
-    Layout:
-      • Graph height grows when controls are collapsed (controls hidden).
-      • When expanded, graph returns to BASE_GRAPH_HEIGHT.
-      • Control positions stay tied to graph bottom so everything shifts consistently.
+    layout:
+      • Graph grows when controls are collapsed.
+      • When controls are visible, controls are packed into the remaining screen height.
+      • Keeps lever, SCRAM, POWER, and dials on-screen for smaller Raspberry Pi displays.
     """
     global GRAPH_HEIGHT, linear_width, right_start
     global LEVER_TRACK_TOP, LEVER_TRACK_BOTTOM, lever_y
     global SCRAM_RECT, POWER_RECT, dial_centers, TOGGLE_RECT
 
-    xins = lever_inserted_fraction(lever_y) if LEVER_TRACK_TOP != 0 else 0.0  # preserve lever inserted fraction during relayout
+    xins = lever_inserted_fraction(lever_y) if LEVER_TRACK_BOTTOM > LEVER_TRACK_TOP else 0.0  # preserve current lever inserted fraction so layout does not change rod position 
 
     if collapsed:
-        bottom_reserve = TOGGLE_GAP + TOGGLE_H + 12   # reserve pixels for tab + small padding
-        GRAPH_HEIGHT = max(260, HEIGHT - (GRAPH_Y + bottom_reserve))  # grow graph as tall as possible
+        bottom_reserve = TOGGLE_GAP + TOGGLE_H + 12  # reserve space below the enlarged graph for the always-visible hide/show tab
+        GRAPH_HEIGHT = max(220, HEIGHT - (GRAPH_Y + bottom_reserve))  # expand graph downward when controls are hidden, but keep a minimum height
     else:
-        GRAPH_HEIGHT = BASE_GRAPH_HEIGHT              # restore default when controls visible
+        GRAPH_HEIGHT = min(int(HEIGHT * 0.34), 260)  # Graph height
 
-    linear_width = GRAPH_WIDTH // 2                   # recompute plot split width
-    right_start  = GRAPH_X + linear_width             # recompute right plot x origin
+    linear_width = GRAPH_WIDTH // 2  # split total graph width evenly between CH2 and CH3
+    right_start  = GRAPH_X + linear_width  # x-position where the right-hand plot begins
 
-    TOGGLE_RECT = pygame.Rect(                         # place toggle directly under graph region
-        GRAPH_X, GRAPH_Y + GRAPH_HEIGHT + TOGGLE_GAP,
-        GRAPH_WIDTH, TOGGLE_H
+    TOGGLE_RECT = pygame.Rect(
+        GRAPH_X,                                  # align tab with graph left edge
+        GRAPH_Y + GRAPH_HEIGHT + TOGGLE_GAP,      # place tab directly below the graphs
+        GRAPH_WIDTH,                              # tab spans full graph width
+        TOGGLE_H                                  # tab height
     )
 
-    LEVER_TRACK_TOP    = GRAPH_Y + GRAPH_HEIGHT + 50  # lever track starts below graph region
-    LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 200        # lever track length fixed
-    lever_y = lever_y_from_inserted(xins)             # restore lever y for preserved inserted fraction
+    if collapsed:  # Keep control geometry valid even while hidden so helper functions still have safe coordinates
+        LEVER_TRACK_TOP = TOGGLE_RECT.bottom + 10
+        LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 120
+        lever_y = lever_y_from_inserted(xins)  # restore lever position using the preserved inserted fraction
+        SCRAM_RECT = pygame.Rect(70, LEVER_TRACK_TOP + 10, 90, 90)  # temporary off-focus SCRAM placement while controls are collapsed
+        POWER_RECT = pygame.Rect(20, HEIGHT - 75, button_width, button_height)  # temporary POWER placement while controls are collapsed
+        dial_centers = [(0, 0), (0, 0)]  # hide dial centers while controls are collapsed
+        return
 
-    SCRAM_RECT = pygame.Rect(70, LEVER_TRACK_TOP + 40, 90, 90)  # SCRAM button follows lever location
+    # -------- Controls region below toggle tab --------
+    controls_top = TOGGLE_RECT.bottom + 10   # start controls just below the tab with a small visual gap
+    controls_bottom = HEIGHT - 10            # keep a small bottom margin so controls do not touch the screen edge
+    controls_h = max(140, controls_bottom - controls_top)  # total vertical space available for the visible controls block
 
-    POWER_RECT = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  # keep POWER BUTTON at bottom-left using current fullscreen HEIGHT
+    track_h = min(120, max(80, controls_h - 70))  # compact lever travel height chosen to balance visibility and available space
+    LEVER_TRACK_TOP = controls_top + 5            # top of lever track within the controls band
+    LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + track_h  # bottom of lever track based on compact Pi-friendly track height
 
-    dial_spacing = GRAPH_WIDTH // (NUM_DIALS + 1)     # spacing for dials across width
-    dial_centers = [                                  # dial centers follow lever track bottom
-        (GRAPH_X + dial_spacing * (i + 1), LEVER_TRACK_BOTTOM + 205)
+    lever_y = lever_y_from_inserted(xins)  # restore lever handle position after layout changes without changing rod insertion
+
+    # SCRAM button placed left of lever region
+    SCRAM_RECT = pygame.Rect(25, LEVER_TRACK_TOP + max(0, (track_h - 90) // 2), 90, 90)
+
+    # POWER button near bottom-left
+    POWER_RECT = pygame.Rect(20, SCRAM_RECT.bottom + 18, button_width, button_height)
+
+    # Dials placed below the lever region while still staying on-screen
+    dial_y = min(HEIGHT - 60, LEVER_TRACK_BOTTOM + 45)  # final dial y-position limited so the dials never fall below the display
+    dial_spacing = GRAPH_WIDTH // (NUM_DIALS + 1)       # spread the two dials evenly across the available control width
+    dial_centers = [
+        (GRAPH_X + dial_spacing * (i + 1), dial_y)      # compute each dial center from equal spacing and the shared dial y-position
         for i in range(NUM_DIALS)
     ]
-
 lever_y = GRAPH_Y + BASE_GRAPH_HEIGHT                 # temporary y so lever_inserted_fraction won't divide by zero
 LEVER_TRACK_TOP = GRAPH_Y + BASE_GRAPH_HEIGHT + 95    # set initial lever track top
 LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 270            # set initial lever track bottom
@@ -889,8 +910,7 @@ while running:
 
         pygame.draw.rect(screen, SCRAM_RED if scram_active else GREY, SCRAM_RECT) # draw SCRAM button
         scr = font.render("SCRAM", True, BLACK)   # render “SCRAM” text
-        screen.blit(scr, scr.get_rect(center=(SCRAM_RECT.centerx, SCRAM_RECT.bottom + 30))) # label below
-
+        screen.blit(scr, scr.get_rect(center=SCRAM_RECT.center)) # center label inside SCRAM button
         pygame.draw.rect(screen, GREY, (LEVER_X - 6, LEVER_TRACK_TOP, 12, LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP)) # lever track
         handle_color = LEVER_INACTIVE_COLOR if (scram_active or not power_on) else (YELLOW if lever_active else BLUE) # handle state color
         pygame.draw.rect(screen, handle_color, (LEVER_X - 14, lever_y, 28, LEVER_HEIGHT)) # lever handle
@@ -910,10 +930,10 @@ while running:
             pygame.draw.line(screen, WHITE, (cx, cy), (x2, y2), 4) # pointer line
 
             cap = font.render(dial_names[i], True, BLACK)          # dial name label
-            screen.blit(cap, cap.get_rect(center=(cx, cy - DIAL_RADIUS - 52))) # place above dial
+            screen.blit(cap, cap.get_rect(center=(cx, cy - DIAL_RADIUS - 34))) # place above dial
 
             det_txt = inst_font.render(f"det {dial_detents[i]:+d}", True, BLACK) # detent readout
-            screen.blit(det_txt, det_txt.get_rect(center=(cx, cy + DIAL_RADIUS + 20))) # place below dial
+            screen.blit(det_txt, det_txt.get_rect(center=(cx, cy + DIAL_RADIUS + 14))) # place below dial
 
     pygame.display.flip()           # present the composed frame to the screen
     clock.tick(60)                  # cap loop to ~60 frames per second (also stabilizes dt)
