@@ -1,4 +1,3 @@
-# AGN-201 Simulation7.2.py
 #
 # PURPOSE
 # -------
@@ -7,7 +6,7 @@
 #   • Maps a single Fine Control Rod (FCR) position → reactivity ρ(t).
 #   • Computes neutron state n(t), precursor C(t), then maps n → power (W).
 #   • Synthesizes two instrument channels (CH2 log, CH3 linear) from power.
-#   • Allows on-screen controls, and supports physical controls via Ethernet.
+#   • Allows on-screen controls, and supports physical controls via serial.
 #   • Provides SCRAM behaviors (manual, external, power switch) and auto-SCRAM on 0 W / 10 W.
 #
 # NOTE ON MODELING CHOICES
@@ -29,21 +28,32 @@
 # Rod withdrawn (down) → more negative ρ
 # Rod inserted (up)  → more positive ρ
 #
-# ETHERNET INPUT FORMAT
+# SERIAL INPUT FORMAT
 # ------------------------------
-# This version polls the Arduino HTTP/JSON endpoint exposed by the current Ethernet sketch:
-#   • HTTP GET to Arduino IP on port 80
-#   • Response body is JSON with fields such as:
-#       scram, power, magnet, forward, backward, pos_min, pos_max, fast_slow,
-#       control_active, position_set, position_read, knob1, knob2, packet1, packet2
+# Expects binary packet from the Arduino sketch (11 bytes ending with 0x24):
+#   packet1, packet2, posSetH, posSetL, posReadH, posReadL, knob1H, knob1L, knob2H, knob2L, 0x24
+#
+#     rod_frac: positionRead / 1023.0   (0 withdrawn, 1 inserted)
+#     ch2_det : quantized knob1 → -3..+3
+#     ch3_det : quantized knob2 → -3..+3
+#     power_sw: bit 1 of packet1 (latched)
+#     scram_sw: bit 0 of packet1 (latched)
+#
+# Debug lines after the packet are skipped automatically.
+# ------------------------------------------------------------------------------
 
 import pygame                     # Pygame for windowing, drawing, keyboard/mouse input, timing
 import sys                        # sys.exit() for clean termination
 import math                       # math for trig/log10/hypot conversions and geometry
 import time                       # time.time() for wall-clock dt and scram timing
 import collections                # collections.deque for fixed-length plot histories
-import socket                     # Ethernet TCP + Bluetooth RFCOMM
-import json                       # JSON decoding for Arduino HTTP status
+import socket                     # Bluetooth RFCOMM
+
+# ---------- OPTIONAL SERIAL ----------
+try:
+    import serial                 # pyserial: reads hardware controls from Arduino/USB serial
+except Exception:
+    serial = None                 # if pyserial not installed, disable serial I/O cleanly
 
 # =========================
 # PHYSICS CONFIG (TUNED 3/14/2026)
@@ -173,7 +183,7 @@ GRAPH_X    = MARGIN_LEFT        # left edge of plot region
 GRAPH_Y    = GRAPH_TOP + HEADER_H   # top of plot region (below header)
 GRAPH_WIDTH  = WIDTH - MARGIN_LEFT - MARGIN_RIGHT  # usable horizontal plot width
 
-BASE_GRAPH_HEIGHT = int(HEIGHT * 0.45)  # default plot height when controls are visible
+BASE_GRAPH_HEIGHT = int(HEIGHT * 0.34)  # default plot height when controls are visible
 TOGGLE_H = 30                   # height of collapse/expand “Controls” tab
 TOGGLE_GAP = 8                  # gap between graph region and the toggle tab
 
@@ -201,7 +211,7 @@ dial_names  = ["CH2 Range (LOG)", "CH3 Range (LIN)"]  # labels
 dial_detents = [0, 0]            # dial detents (integers -3..+3), applied to CH2 and CH3
 
 # Buttons
-button_width, button_height = 120, 55   # size for POWER button
+button_width, button_height = 100, 50   # size for POWER button
 power_on = False                        # system “powered” state; gates physics updates
 #POWER_RECT = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  # POWER button rectangle
 POWER_RECT = pygame.Rect(0, 0, button_width, button_height)  # placeholder; real position set in update_layout()
@@ -248,25 +258,30 @@ low_scram_timer  = 0.0            # accumulates time spent below SCRAM_LOW_W
 
 last_time = time.time()           # previous frame wall-clock time used to compute dt
 
-# ---------- ETHERNET CONTROL ----------
-# Arduino code provided exposes HTTP/JSON status on port 80.
-ETH_ARDUINO_IP = "134.50.51.21"  # Arduino Ethernet IP address 
-ETH_ARDUINO_PORT = 80            # Arduino HTTP server port 
-ETH_POLL_INTERVAL_S = 0.50       # 5 Hz polling matches the Arduino's ~200 ms status cadence well
-ETH_HTTP_TIMEOUT_S = 0.03        # short timeout keeps polling from visibly stalling the GUI
-ETH_STARTUP_DELAY_S = 1.0        # wait this long after program start before first Ethernet poll
-eth_next_poll = time.time() + ETH_STARTUP_DELAY_S  # earliest wall-time when Ethernet is allowed to poll
-eth_last_ok = 0.0                # timestamp of most recent successful HTTP/JSON read
-eth_connected = False            # whether the last HTTP/JSON poll succeeded
+# ---------- SERIAL ----------
+BAUDRATE = 9600                   # serial speed; must match Arduino sketch
+SERIAL_PORTS = (                  # candidate device paths to try (Linux/RPi naming)
+    "/dev/ttyACM0", "/dev/ttyACM1",
+    "/dev/ttyUSB0", "/dev/ttyUSB1",
+    "/dev/serial0"
+)
 
-latest_packet_debug = {           # latest decoded Arduino packet values (for debug / display)
-    "packet1": 0,
-    "packet2": 0,
-    "position_set": 0,
-    "position_read": 0,
-    "rotary1": 0,
-    "rotary2": 0,
-}
+def setup_serial():
+    if serial is None:            # if pyserial missing, skip serial
+        return None
+    for p in SERIAL_PORTS:        # try each possible port in order
+        try:
+            s = serial.Serial(p, BAUDRATE, timeout=0)  # open port in non-blocking mode to avoid frame stalls
+            time.sleep(1.0)       # give Arduino time to reset after opening port
+            return s              # return open serial object on success
+        except Exception:
+            pass                  # ignore failures and continue trying other ports
+    return None                   # no port found
+
+ser = setup_serial()              # attempt to open serial once at startup
+
+# Persistent buffer for binary packet parsing (handles Arduino 0x24 packets + debug printlns)
+rx_buffer = bytearray()
 
 # =========================
 # BLUETOOTH SEND (Pi #1 -> Pi #2)
@@ -296,6 +311,63 @@ def bt_connect():
     s.settimeout(0.0)                    # set non-blocking mode for send() so Bluetooth cannot stall the frame loop
     return s                             # Return connected socket
 
+def read_controls_from_serial(ser_obj):
+    if ser_obj is None:           # if no serial object, no data
+        return None
+    try:
+        # Only read when data is actually waiting (non-blocking)
+        if hasattr(ser_obj, "in_waiting") and ser_obj.in_waiting <= 0:
+            return None
+
+        data = ser_obj.read(ser_obj.in_waiting)
+        if not data:
+            return None
+
+        rx_buffer.extend(data)
+
+        # Process any complete packet(s) ending with 0x24
+        while len(rx_buffer) >= 11:
+            try:
+                idx = rx_buffer.index(0x24)
+                if idx >= 10:
+                    # Extract the 10 data bytes immediately before the 0x24
+                    pkt = rx_buffer[idx - 10:idx]
+                    packet1 = pkt[0]
+                    # packet2 = pkt[1]          # unused
+                    # pos_set  = (pkt[2] << 8) | pkt[3]   # unused (stepper speed)
+                    pos_read = (pkt[4] << 8) | pkt[5]
+                    knob1    = (pkt[6] << 8) | pkt[7]
+                    knob2    = (pkt[8] << 8) | pkt[9]
+
+                    # === MAPPINGS FOR SIMULATOR ===
+                    rod_frac = pos_read / 1023.0                                 # 0..1 (physical rod feedback)
+                    # If your pot is wired backwards, uncomment the next line:
+                    # rod_frac = 1.0 - rod_frac
+
+                    # Quantize rotary knobs to detents -3..+3 (7 positions)
+                    ch2_det = int(round((knob1 / 1023.0) * 6 - 3))
+                    ch2_det = max(-3, min(3, ch2_det))
+                    ch3_det = int(round((knob2 / 1023.0) * 6 - 3))
+                    ch3_det = max(-3, min(3, ch3_det))
+
+                    power_sw = bool(packet1 & (1 << 1))   # latched power toggle
+                    scram_sw = bool(packet1 & (1 << 0))   # latched scram toggle
+
+                    # Remove processed packet (including terminator) from buffer
+                    del rx_buffer[:idx + 1]
+
+                    return (rod_frac, ch2_det, ch3_det, power_sw, scram_sw)
+
+                else:
+                    # 0x24 appeared too early → discard junk
+                    del rx_buffer[:idx + 1]
+            except ValueError:
+                break  # no 0x24 in buffer yet
+
+        return None  # no complete packet this frame
+    except Exception:
+        return None                # if parsing fails, ignore line
+
 # =========================
 # HELPERS
 # =========================
@@ -315,21 +387,6 @@ def format_watts(P):
     if P >= 0.01:
         return f"{P:.4f} W"
     return f"{P:.6f} W"
-
-def u16_from_hi_lo(hi, lo):
-    return (int(hi) << 8) | int(lo)  # combine two bytes into one unsigned 16-bit value
-
-def analog_to_fraction(raw):
-    raw = clamp(float(raw), 0.0, 1023.0)  # clamp ADC value into legal 10-bit range
-    return raw / 1023.0                   # convert 0..1023 to 0..1 fraction
-
-def analog_to_detent(raw):
-    raw = clamp(float(raw), 0.0, 1023.0)  # clamp ADC value into legal 10-bit range
-    det = int(round((raw / 1023.0) * 6.0)) - 3  # map 0..1023 to detents -3..+3
-    return int(clamp(det, -3, 3))         # clamp final detent to legal range
-
-def bit_is_set(value, bit_index):
-    return bool((int(value) >> bit_index) & 0x01)  # test whether a given bit is set
 
 def kinetics_rhs(n_s, C_s, rho):
     # POINT KINETICS (1 delayed group)
@@ -445,146 +502,11 @@ def fcr_inserted_worth_fraction(x_inserted):                # Convert inserted f
     f_inserted = clamp(pct / 100.0, 0.0, 1.0)               # convert to fraction 0..1
     return f_inserted                                       # final fraction of total worth inserted
 
-def build_packet_bytes_from_json(doc):
-    """Reconstruct packet bytes for debug compatibility when JSON packet bytes are absent."""
-    packet1 = 0
-    if bool(doc.get("scram", False)):
-        packet1 |= (1 << 0)
-    if bool(doc.get("power", False)):
-        packet1 |= (1 << 1)
-    if bool(doc.get("magnet", False)):
-        packet1 |= (1 << 2)
-    if bool(doc.get("forward", False)):
-        packet1 |= (1 << 3)
-    if bool(doc.get("backward", False)):
-        packet1 |= (1 << 4)
-    if bool(doc.get("pos_min", False)):
-        packet1 |= (1 << 5)
-    if bool(doc.get("pos_max", False)):
-        packet1 |= (1 << 6)
-    if bool(doc.get("fast_slow", False)):
-        packet1 |= (1 << 7)
-
-    packet2 = 0
-    if bool(doc.get("control_active", False)):
-        packet2 |= (1 << 0)
-    return packet1, packet2
-
-def eth_fetch_json_once():
-    """Poll the Arduino HTTP/JSON endpoint once and return a decoded dict, or None on failure."""
-    request = (
-        f"GET / HTTP/1.1\r\n"
-        f"Host: {ETH_ARDUINO_IP}\r\n"
-        f"Connection: close\r\n\r\n"
-    ).encode("ascii")
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(ETH_HTTP_TIMEOUT_S)
-    try:
-        s.connect((ETH_ARDUINO_IP, ETH_ARDUINO_PORT))
-        s.sendall(request)
-
-        chunks = []
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-
-    if not chunks:
-        return None
-
-    response = b"".join(chunks)
-    sep = b"\r\n\r\n"
-    body = response.split(sep, 1)[1] if sep in response else response
-    body = body.strip()
-    if not body:
-        return None
-
-    i0 = body.find(b"{")
-    i1 = body.rfind(b"}")
-    if i0 == -1 or i1 == -1 or i1 < i0:
-        return None
-
-    return json.loads(body[i0:i1 + 1].decode("utf-8", errors="ignore"))
-
-def parse_arduino_json(doc):
-    """Map Arduino HTTP/JSON status into the simulator control tuple."""
-    global latest_packet_debug
-
-    if not isinstance(doc, dict):
-        return None
-
-    position_set = int(doc.get("position_set", 0) or 0)
-    position_read = int(doc.get("position_read", 0) or 0)
-    rotary1_read = int(doc.get("knob1", 0) or 0)
-    rotary2_read = int(doc.get("knob2", 0) or 0)
-
-    packet1 = doc.get("packet1", None)
-    packet2 = doc.get("packet2", None)
-    if packet1 is None or packet2 is None:
-        packet1, packet2 = build_packet_bytes_from_json(doc)
-    else:
-        packet1 = int(packet1)
-        packet2 = int(packet2)
-
-    latest_packet_debug = {
-        "packet1": packet1,
-        "packet2": packet2,
-        "position_set": position_set,
-        "position_read": position_read,
-        "rotary1": rotary1_read,
-        "rotary2": rotary2_read,
-    }
-
-    rod_frac = analog_to_fraction(position_read)  # use actual rod feedback as simulator rod position
-    ch2_det  = analog_to_detent(rotary1_read)     # map knob 1 to CH2 detent
-    ch3_det  = analog_to_detent(rotary2_read)     # map knob 2 to CH3 detent
-
-    scram_sw = bool(doc.get("scram", False))      # JSON scram flag
-    power_sw = bool(doc.get("power", False))      # JSON power flag
-
-    return rod_frac, ch2_det, ch3_det, power_sw, scram_sw
-
-def read_controls_from_ethernet(now):
-    """Poll the Arduino's HTTP/JSON status endpoint at a controlled rate."""
-    global eth_next_poll, eth_last_ok, eth_connected
-
-    if now < eth_next_poll:
-        return None
-    eth_next_poll = now + ETH_POLL_INTERVAL_S
-
-    try:
-        doc = eth_fetch_json_once()
-    except Exception:
-        eth_connected = False
-        return None
-
-    if doc is None:
-        eth_connected = False
-        return None
-
-    eth_connected = True
-    eth_last_ok = now
-    return parse_arduino_json(doc)
-
-def send_flipmask_command(flipmask):
-    # Current Arduino Ethernet code is status-only.
-    # The 0x24, 0xFF, flipmask parser exists on Arduino Serial1, not Ethernet.
-    # Keep this as a no-op so test hotkeys do not break the program.
-    return False
-
 def reset_on_power_on(now): # Reset state variables when transitioning from OFF → ON (fresh run condition).
     global n, C, rho_prev, rho_now
     global ch2_I_ind, ch3_I_ind
     global sim_time_s, power_on_wall_time
-    global high_scram_timer, low_scram_timer
-    global lever_y, lever_active, selected_lever, selected_dial, dial_active
+    global high_scram_timer, low_scram_timer  
 
     power_history.clear()          # clear stored power trace
     ch2_history.clear()            # clear CH2 trace
@@ -605,12 +527,6 @@ def reset_on_power_on(now): # Reset state variables when transitioning from OFF 
     high_scram_timer = 0.0         # reset high-power debounce timer
     low_scram_timer  = 0.0         # reset low-power debounce timer
 
-    lever_y = LEVER_TRACK_BOTTOM - LEVER_HEIGHT   # start each powered run with lever fully withdrawn (down)
-    lever_active = False
-    selected_lever = False
-    selected_dial = None
-    dial_active[:] = [False, False]
-
 def start_scram(reason, now):
     global scram_active, scram_start_time, scram_reason
     global high_scram_timer, low_scram_timer
@@ -623,45 +539,66 @@ def start_scram(reason, now):
 
 def update_layout(collapsed):
     """
-    Layout:
-      • Graph height grows when controls are collapsed (controls hidden).
-      • When expanded, graph returns to BASE_GRAPH_HEIGHT.
-      • Control positions stay tied to graph bottom so everything shifts consistently.
+    layout:
+      • Graph grows when controls are collapsed.
+      • When controls are visible, controls are packed into the remaining screen height.
+      • Keeps lever, SCRAM, POWER, and dials on-screen for smaller Raspberry Pi displays.
     """
     global GRAPH_HEIGHT, linear_width, right_start
     global LEVER_TRACK_TOP, LEVER_TRACK_BOTTOM, lever_y
     global SCRAM_RECT, POWER_RECT, dial_centers, TOGGLE_RECT
 
-    xins = lever_inserted_fraction(lever_y) if LEVER_TRACK_TOP != 0 else 0.0  # preserve lever inserted fraction during relayout
+    xins = lever_inserted_fraction(lever_y) if LEVER_TRACK_BOTTOM > LEVER_TRACK_TOP else 0.0  # preserve current lever inserted fraction so layout does not change rod position 
 
     if collapsed:
-        bottom_reserve = TOGGLE_GAP + TOGGLE_H + 12   # reserve pixels for tab + small padding
-        GRAPH_HEIGHT = max(260, HEIGHT - (GRAPH_Y + bottom_reserve))  # grow graph as tall as possible
+        bottom_reserve = TOGGLE_GAP + TOGGLE_H + 12  # reserve space below the enlarged graph for the always-visible hide/show tab
+        GRAPH_HEIGHT = max(220, HEIGHT - (GRAPH_Y + bottom_reserve))  # expand graph downward when controls are hidden, but keep a minimum height
     else:
-        GRAPH_HEIGHT = BASE_GRAPH_HEIGHT              # restore default when controls visible
+        GRAPH_HEIGHT = min(int(HEIGHT * 0.34), 260)  # Graph height
 
-    linear_width = GRAPH_WIDTH // 2                   # recompute plot split width
-    right_start  = GRAPH_X + linear_width             # recompute right plot x origin
+    linear_width = GRAPH_WIDTH // 2  # split total graph width evenly between CH2 and CH3
+    right_start  = GRAPH_X + linear_width  # x-position where the right-hand plot begins
 
-    TOGGLE_RECT = pygame.Rect(                         # place toggle directly under graph region
-        GRAPH_X, GRAPH_Y + GRAPH_HEIGHT + TOGGLE_GAP,
-        GRAPH_WIDTH, TOGGLE_H
+    TOGGLE_RECT = pygame.Rect(
+        GRAPH_X,                                  # align tab with graph left edge
+        GRAPH_Y + GRAPH_HEIGHT + TOGGLE_GAP,      # place tab directly below the graphs
+        GRAPH_WIDTH,                              # tab spans full graph width
+        TOGGLE_H                                  # tab height
     )
 
-    LEVER_TRACK_TOP    = GRAPH_Y + GRAPH_HEIGHT + 50  # lever track starts below graph region
-    LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 200        # lever track length fixed
-    lever_y = lever_y_from_inserted(xins)             # restore lever y for preserved inserted fraction
+    if collapsed:  # Keep control geometry valid even while hidden so helper functions still have safe coordinates
+        LEVER_TRACK_TOP = TOGGLE_RECT.bottom + 10
+        LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 120
+        lever_y = lever_y_from_inserted(xins)  # restore lever position using the preserved inserted fraction
+        SCRAM_RECT = pygame.Rect(70, LEVER_TRACK_TOP + 10, 90, 90)  # temporary off-focus SCRAM placement while controls are collapsed
+        POWER_RECT = pygame.Rect(20, HEIGHT - 75, button_width, button_height)  # temporary POWER placement while controls are collapsed
+        dial_centers = [(0, 0), (0, 0)]  # hide dial centers while controls are collapsed
+        return
 
-    SCRAM_RECT = pygame.Rect(70, LEVER_TRACK_TOP + 40, 90, 90)  # SCRAM button follows lever location
+    # -------- Controls region below toggle tab --------
+    controls_top = TOGGLE_RECT.bottom + 10   # start controls just below the tab with a small visual gap
+    controls_bottom = HEIGHT - 10            # keep a small bottom margin so controls do not touch the screen edge
+    controls_h = max(140, controls_bottom - controls_top)  # total vertical space available for the visible controls block
 
-    POWER_RECT = pygame.Rect(60, HEIGHT - 155, button_width, button_height)  # keep POWER BUTTON at bottom-left using current fullscreen HEIGHT
+    track_h = min(120, max(80, controls_h - 70))  # compact lever travel height chosen to balance visibility and available space
+    LEVER_TRACK_TOP = controls_top + 5            # top of lever track within the controls band
+    LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + track_h  # bottom of lever track based on compact Pi-friendly track height
 
-    dial_spacing = GRAPH_WIDTH // (NUM_DIALS + 1)     # spacing for dials across width
-    dial_centers = [                                  # dial centers follow lever track bottom
-        (GRAPH_X + dial_spacing * (i + 1), LEVER_TRACK_BOTTOM + 205)
+    lever_y = lever_y_from_inserted(xins)  # restore lever handle position after layout changes without changing rod insertion
+
+    # SCRAM button placed left of lever region
+    SCRAM_RECT = pygame.Rect(25, LEVER_TRACK_TOP + max(0, (track_h - 90) // 2), 90, 90)
+
+    # POWER button near bottom-left
+    POWER_RECT = pygame.Rect(20, SCRAM_RECT.bottom + 18, button_width, button_height)
+
+    # Dials placed below the lever region while still staying on-screen
+    dial_y = min(HEIGHT - 60, LEVER_TRACK_BOTTOM + 45)  # final dial y-position limited so the dials never fall below the display
+    dial_spacing = GRAPH_WIDTH // (NUM_DIALS + 1)       # spread the two dials evenly across the available control width
+    dial_centers = [
+        (GRAPH_X + dial_spacing * (i + 1), dial_y)      # compute each dial center from equal spacing and the shared dial y-position
         for i in range(NUM_DIALS)
     ]
-
 lever_y = GRAPH_Y + BASE_GRAPH_HEIGHT                 # temporary y so lever_inserted_fraction won't divide by zero
 LEVER_TRACK_TOP = GRAPH_Y + BASE_GRAPH_HEIGHT + 95    # set initial lever track top
 LEVER_TRACK_BOTTOM = LEVER_TRACK_TOP + 270            # set initial lever track bottom
@@ -683,30 +620,24 @@ while running:
         dt = 0.1
     last_time = now                                   # update last_time for next frame
 
-    # ---------- ETHERNET INPUT ----------
-    sc = read_controls_from_ethernet(now)                    # poll Arduino HTTP/JSON status at a controlled rate
-    if sc is not None:                                       # if valid data received
-        rod_frac, ch2_det, ch3_det, power_sw, scram_sw = sc # unpack controls
-        dial_detents[0] = ch2_det                           # set CH2 dial detent
-        dial_detents[1] = ch3_det                           # set CH3 dial detent
+    # ---------- SERIAL INPUT ----------
+    sc = read_controls_from_serial(ser)               # attempt to read one serial control line
+    if sc is not None:                                # if valid data received
+        rod_frac, ch2_det, ch3_det, power_sw, scram_sw = sc  # unpack controls
+        lever_y = lever_y_from_inserted(rod_frac)     # set lever position from inserted fraction
+        dial_detents[0] = ch2_det                     # set CH2 dial detent
+        dial_detents[1] = ch3_det                     # set CH3 dial detent
 
-        if power_sw and not power_on:                       # rising edge: switch OFF → ON
-            power_on = True
-            scram_active = False
-            scram_start_time = 0.0
-            scram_reason = ""
-            reset_on_power_on(now)
-        elif (not power_sw) and power_on and (not scram_active):  # falling edge: ON → OFF triggers scram
-            start_scram("POWER SWITCH OFF", now)
-
-        if scram_sw and power_on and (not scram_active):    # external scram input
-            start_scram("EXTERNAL SCRAM", now)
-
-        #if power_on and not scram_active:                   # only follow hardware rod position while actually running
-        #    lever_y = lever_y_from_inserted(rod_frac)
-        #    lever_y = first_order_lag(lever_y, target_lever_y, dt, 0.35)
-            # Do not overwrite lever_y from Ethernet readback here.
-            # Keep the simulator lever smooth and command-owned on the Python side.
+        if power_sw and not power_on:                 # rising edge: switch OFF → ON
+            power_on = True                           # enable power state
+            scram_active = False                      # clear scram state
+            scram_start_time = 0.0                    # reset scram timing
+            scram_reason = ""                         # clear scram reason
+            reset_on_power_on(now)                    # reset physics and instruments to startup conditions
+        if (not power_sw) and power_on and (not scram_active):  # falling edge: ON → OFF triggers scram
+            start_scram("POWER SWITCH OFF", now)       # enter SCRAM sequence
+        if scram_sw and power_on and (not scram_active):         # external scram input
+            start_scram("EXTERNAL SCRAM", now)         # enter SCRAM sequence
 
     # ---------- EVENTS ----------
     for event in pygame.event.get():                  # process Pygame event queue (for windowed mode)
@@ -716,12 +647,6 @@ while running:
         elif event.type == pygame.KEYDOWN:            # ESC key exits fullscreen
             if event.key == pygame.K_ESCAPE:          # window close execute
                 running = False                       # exit loop
-            elif event.key == pygame.K_F1:            # optional test hotkey (no-op over current Ethernet implementation)
-                send_flipmask_command(1 << 0)
-            elif event.key == pygame.K_F2:            # optional test hotkey (no-op over current Ethernet implementation)
-                send_flipmask_command(1 << 1)
-            elif event.key == pygame.K_F3:            # optional test hotkey (no-op over current Ethernet implementation)
-                send_flipmask_command(1 << 2)
 
         elif event.type == pygame.MOUSEBUTTONDOWN:    # mouse click
             mx, my = event.pos                        # mouse coordinates (px)
@@ -808,7 +733,7 @@ while running:
 
     # ---------- SCRAM BEHAVIOR ----------
     if scram_active:                             # if currently scramming
-        lever_y = LEVER_TRACK_BOTTOM - LEVER_HEIGHT   # force lever fully dropped visually
+        lever_y = LEVER_TRACK_TOP                # force lever fully inserted visually
         if (now - scram_start_time) > 3.0:       # after scram hold duration
             power_on = False                     # shut system power off
             scram_active = False                 # exit scram state
@@ -832,7 +757,7 @@ while running:
             high_scram_timer = 0.0               # reset debounce timers
             low_scram_timer  = 0.0
 
-            lever_y = LEVER_TRACK_BOTTOM - LEVER_HEIGHT   # keep lever dropped
+            lever_y = LEVER_TRACK_TOP            # keep lever inserted
             dial_detents[:] = [0, 0]             # reset dials to center detent
             lever_active = False                 # drop selections
             dial_active[:] = [False, False]
@@ -993,17 +918,6 @@ while running:
     )
     screen.blit(k_text, k_text.get_rect(center=(GRAPH_X + GRAPH_WIDTH // 2, header_y0 + 34)))  # centered
 
-    eth_dbg = inst_font.render(                # render latest Ethernet packet values for bring-up / testing
-        f"ETH p1:{latest_packet_debug['packet1']:08b} "
-        f"p2:{latest_packet_debug['packet2']:08b} "
-        f"set:{latest_packet_debug['position_set']:4d} "
-        f"read:{latest_packet_debug['position_read']:4d} "
-        f"k1:{latest_packet_debug['rotary1']:4d} "
-        f"k2:{latest_packet_debug['rotary2']:4d}",
-        True, BLACK
-    )
-    screen.blit(eth_dbg, (GRAPH_X, header_y0 + 52))
-
     left_label = title_font.render("Channel 2 (Log Current)", True, BLACK)  # left plot title
     screen.blit(left_label, left_label.get_rect(center=(GRAPH_X + linear_width // 2, GRAPH_Y - 18)))  # place above left plot
     right_label = title_font.render("Channel 3 (Linear Current)", True, BLACK) # right plot title
@@ -1032,8 +946,7 @@ while running:
 
         pygame.draw.rect(screen, SCRAM_RED if scram_active else GREY, SCRAM_RECT) # draw SCRAM button
         scr = font.render("SCRAM", True, BLACK)   # render “SCRAM” text
-        screen.blit(scr, scr.get_rect(center=(SCRAM_RECT.centerx, SCRAM_RECT.bottom + 30))) # label below
-
+        screen.blit(scr, scr.get_rect(center=SCRAM_RECT.center)) # center label inside SCRAM button
         pygame.draw.rect(screen, GREY, (LEVER_X - 6, LEVER_TRACK_TOP, 12, LEVER_TRACK_BOTTOM - LEVER_TRACK_TOP)) # lever track
         handle_color = LEVER_INACTIVE_COLOR if (scram_active or not power_on) else (YELLOW if lever_active else BLUE) # handle state color
         pygame.draw.rect(screen, handle_color, (LEVER_X - 14, lever_y, 28, LEVER_HEIGHT)) # lever handle
@@ -1053,18 +966,13 @@ while running:
             pygame.draw.line(screen, WHITE, (cx, cy), (x2, y2), 4) # pointer line
 
             cap = font.render(dial_names[i], True, BLACK)          # dial name label
-            screen.blit(cap, cap.get_rect(center=(cx, cy - DIAL_RADIUS - 52))) # place above dial
+            screen.blit(cap, cap.get_rect(center=(cx, cy - DIAL_RADIUS - 34))) # place above dial
 
             det_txt = inst_font.render(f"det {dial_detents[i]:+d}", True, BLACK) # detent readout
-            screen.blit(det_txt, det_txt.get_rect(center=(cx, cy + DIAL_RADIUS + 20))) # place below dial
+            screen.blit(det_txt, det_txt.get_rect(center=(cx, cy + DIAL_RADIUS + 14))) # place below dial
 
     pygame.display.flip()           # present the composed frame to the screen
     clock.tick(60)                  # cap loop to ~60 frames per second (also stabilizes dt)
 
-try:
-    if bt_sock is not None:
-        bt_sock.close()             # close Bluetooth socket cleanly on shutdown
-except Exception:
-    pass
 pygame.quit()                      # shut down Pygame cleanly
-sys.exit()
+sys.exit()                         # exit program
